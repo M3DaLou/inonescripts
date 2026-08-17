@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # vps-netcheck.sh — Debian VPS 出网一键体检
 # 在节点本机运行，检查「这台机器访问外网」是否正常。
-# 默认只体检、不改系统。修复 / 流媒体 / Telegram / 指定 DNS 都是可选参数。
+# 默认只体检、不改系统。修复 / 流媒体 / Telegram / 指定 IP 质量 / 指定 DNS 都是可选参数。
 
 set -uo pipefail
 
-VERSION="1.4.0"
+VERSION="1.5.0"
 MODE="default"
 CUSTOM_URLS=()
 CUSTOM_FILE=""
@@ -18,6 +18,10 @@ UNLOCK_REGION="auto"
 UNLOCK_IP="4"
 TELEGRAM=0
 TELEGRAM_ONLY=0
+QUALITY=0
+QUALITY_ONLY=0
+QUALITY_TARGETS=()
+QUALITY_COUNT=20
 DNS_SERVERS=()
 FIX_PROMPT=0
 FIX_IPV6=0
@@ -78,6 +82,11 @@ Telegram（可选，测节点到 TG 机房/官网，用来排除「TG 服务器�
   --telegram           体检后再测 Telegram
   --telegram-only      只测 Telegram，跳过网络体检
 
+指定 IP 网络质量（独立于体检，测路由 / 延迟 / 丢包）:
+  --quality IP[,IP...]       体检后再测这些目标
+  --quality-only IP[,IP...]  只测这些目标，不跑网络体检
+  --quality-count N          ping / mtr 探测次数，默认 20（5–100）
+
 可选修复（默认不执行；改系统前会问一声，--yes 才跳过确认）:
   --fix                体检结束后，对发现的问题逐项询问是否修复
   --fix-ipv6           持久关闭 IPv6（写 sysctl.d，重启仍生效）
@@ -96,6 +105,10 @@ Telegram（可选，测节点到 TG 机房/官网，用来排除「TG 服务器�
   --interactive          强制进入交互菜单
   --list-unlock-regions  列出流媒体区域编号后退出
   -h, --help             显示帮助
+
+例子:
+  bash vps-netcheck.sh --quality-only 1.1.1.1,8.8.8.8
+  bash vps-netcheck.sh --quality-only 1.1.1.1 --quality-count 30
 
 建议用 root 跑。结果写到 /tmp/vps-netcheck-时间戳.log
 EOF
@@ -140,6 +153,40 @@ need_arg() {
   fi
 }
 
+is_ipv4_addr() {
+  [[ "$1" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]
+}
+
+is_ipv6_addr() {
+  [[ "$1" == *:* ]]
+}
+
+valid_quality_target() {
+  local t="$1"
+  [[ -z "$t" || "$t" == --* || "$t" == */* ]] && return 1
+  is_ipv4_addr "$t" && return 0
+  is_ipv6_addr "$t" && return 0
+  [[ "$t" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$ ]]
+}
+
+append_quality_targets() {
+  local raw="$1" t
+  local tmp=()
+  raw="${raw//,/ }"
+  for t in $raw; do
+    if ! valid_quality_target "$t"; then
+      echo "无效目标: $t（只要 IPv4 / IPv6 / 域名）"
+      return 1
+    fi
+    tmp+=("$t")
+  done
+  if [[ ${#tmp[@]} -eq 0 ]]; then
+    echo "至少需要一个 IP 或域名"
+    return 1
+  fi
+  QUALITY_TARGETS+=("${tmp[@]}")
+}
+
 ORIG_ARGC=$#
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -159,6 +206,24 @@ while [[ $# -gt 0 ]]; do
     --unlock-ip) need_arg "$@"; UNLOCK_IP="$2"; shift 2 ;;
     --telegram) TELEGRAM=1; shift ;;
     --telegram-only) TELEGRAM=1; TELEGRAM_ONLY=1; shift ;;
+    --quality)
+      QUALITY=1
+      need_arg "$@"
+      append_quality_targets "$2" || exit 1
+      shift 2
+      ;;
+    --quality-only)
+      QUALITY=1
+      QUALITY_ONLY=1
+      need_arg "$@"
+      append_quality_targets "$2" || exit 1
+      shift 2
+      ;;
+    --quality-count)
+      need_arg "$@"
+      QUALITY_COUNT="$2"
+      shift 2
+      ;;
     --fix) FIX_PROMPT=1; shift ;;
     --fix-ipv6) FIX_IPV6=1; shift ;;
     --undo-ipv6) UNDO_IPV6=1; shift ;;
@@ -194,6 +259,10 @@ if [[ "$UNLOCK_IP" != "4" && "$UNLOCK_IP" != "6" && "$UNLOCK_IP" != "0" ]]; then
   echo "--unlock-ip 只能是 4、6 或 0"
   exit 1
 fi
+
+valid_quality_count() {
+  [[ "$1" =~ ^[0-9]+$ ]] && [[ "$1" -ge 5 && "$1" -le 100 ]]
+}
 
 prompt_val() {
   local p="$1" d="${2:-}"
@@ -269,6 +338,36 @@ ask_telegram_optional() {
   [[ "$yn" == "y" || "$yn" == "Y" ]] && TELEGRAM=1
 }
 
+ask_quality_options() {
+  echo
+  echo "测到哪些 IP 的网络质量？多个用逗号或空格分隔。"
+  echo "例: 1.1.1.1,8.8.8.8  或  你的业务 / 对端 IP"
+  local raw
+  while true; do
+    raw=$(prompt_val "目标 IP" "")
+    if [[ -z "$raw" ]]; then
+      echo "  至少填一个 IP。"
+      continue
+    fi
+    QUALITY_TARGETS=()
+    if append_quality_targets "$raw"; then
+      break
+    fi
+  done
+
+  echo
+  echo "探测次数越大，丢包和抖动越准，也越慢（每项目标大约 2×次数 秒）。"
+  local c
+  while true; do
+    c=$(prompt_val "每项目标探测次数" "20")
+    if valid_quality_count "$c"; then
+      QUALITY_COUNT="$c"
+      break
+    fi
+    echo "  请输入 5–100 的整数。"
+  done
+}
+
 ask_depth() {
   echo
   echo "体检要做到哪一步？"
@@ -297,8 +396,9 @@ run_interactive() {
   echo "  2) 网络体检 + 流媒体解锁"
   echo "  3) 只测流媒体解锁"
   echo "  4) 只测 Telegram（到 TG 机房延迟 + 官网下载）"
-  echo "  5) 修复（关 IPv6 / 改 MTU / 改 DNS）"
-  echo "  6) 看命令行帮助"
+  echo "  5) 指定 IP 网络质量（路由 / 延迟 / 丢包，不跑体检）"
+  echo "  6) 修复（关 IPv6 / 改 MTU / 改 DNS）"
+  echo "  7) 看命令行帮助"
   echo "  q) 退出"
   echo
 
@@ -306,14 +406,14 @@ run_interactive() {
   while true; do
     act=$(prompt_val "输入序号" "1")
     case "$act" in
-      1|2|3|4|5|6|q|Q) break ;;
-      *) echo "  请输入 1–6 或 q。" ;;
+      1|2|3|4|5|6|7|q|Q) break ;;
+      *) echo "  请输入 1–7 或 q。" ;;
     esac
   done
 
   case "$act" in
     q|Q) echo "已取消。"; exit 0 ;;
-    6) usage; exit 0 ;;
+    7) usage; exit 0 ;;
     1)
       ask_depth
       ask_extra_url
@@ -344,6 +444,11 @@ run_interactive() {
       ask_dns_optional
       ;;
     5)
+      QUALITY=1
+      QUALITY_ONLY=1
+      ask_quality_options
+      ;;
+    6)
       echo
       echo "要做哪项修复？"
       echo "  1)  先体检，再按结果询问（最稳）"
@@ -407,6 +512,17 @@ if [[ $FORCE_INTERACTIVE -eq 1 ]]; then
   run_interactive
 elif [[ $ORIG_ARGC -eq 0 && -t 0 && -t 1 ]]; then
   run_interactive
+fi
+
+if [[ $QUALITY -eq 1 ]]; then
+  if [[ ${#QUALITY_TARGETS[@]} -eq 0 ]]; then
+    echo "--quality / --quality-only 需要至少一个 IP，例如: --quality-only 1.1.1.1,8.8.8.8"
+    exit 1
+  fi
+  if ! valid_quality_count "$QUALITY_COUNT"; then
+    echo "--quality-count 必须是 5–100 的整数"
+    exit 1
+  fi
 fi
 
 ts() { date '+%F %T'; }
@@ -506,6 +622,10 @@ ensure_deps() {
   have ip || pkgs+=(iproute2)
   have openssl || pkgs+=(openssl)
   [[ "$MODE" == "full" ]] && { have traceroute || pkgs+=(traceroute); }
+  if [[ $QUALITY -eq 1 ]]; then
+    have mtr || pkgs+=(mtr-tiny)
+    have traceroute || pkgs+=(traceroute)
+  fi
   dpkg -s ca-certificates >/dev/null 2>&1 || pkgs+=(ca-certificates)
 
   if [[ ${#pkgs[@]} -gt 0 ]]; then
@@ -1269,6 +1389,416 @@ EOF
   info "这测的是官网和机房入口，和 App 里某条视频的 CDN 会略有差别，但足以排除 TG 宕机。"
 }
 
+# ---------- 指定 IP 网络质量（独立于体检）----------
+QUALITY_ROWS=()
+
+ensure_quality_deps() {
+  section "0" "检查依赖（网络质量）"
+  local pkgs=()
+  have ping || pkgs+=(iputils-ping)
+  have mtr || pkgs+=(mtr-tiny)
+  have traceroute || pkgs+=(traceroute)
+  have curl || pkgs+=(curl)
+  have ip || pkgs+=(iproute2)
+  if [[ ${#pkgs[@]} -gt 0 ]]; then
+    need_root_install "${pkgs[@]}" || true
+  fi
+  have ping || warn "没有 ping，ICMP 延迟/丢包会跳过"
+  if have mtr; then
+    ok "mtr 可用（按跳看路由质量）"
+  elif have traceroute; then
+    warn "没有 mtr，路由改用 traceroute（看不到每跳丢包统计）"
+  else
+    warn "没有 mtr / traceroute，将跳过路由质量"
+  fi
+}
+
+quality_ping_iv() {
+  [[ "$(id -u)" -eq 0 ]] && echo 0.2 || echo 1
+}
+
+quality_mtr_iv() {
+  [[ "$(id -u)" -eq 0 ]] && echo 0.3 || echo 1
+}
+
+quality_fam() {
+  if is_ipv6_addr "$1"; then
+    echo 6
+  elif is_ipv4_addr "$1"; then
+    echo 4
+  else
+    echo 0
+  fi
+}
+
+quality_resolve() {
+  local t="$1"
+  if is_ipv4_addr "$t" || is_ipv6_addr "$t"; then
+    printf '%s' "$t"
+    return
+  fi
+  if have getent; then
+    getent ahosts "$t" 2>/dev/null | awk '{print $1}' | awk '!a[$1]++' | head -n 4 | tr '\n' ' '
+    return
+  fi
+  if have dig; then
+    {
+      dig +time=2 +tries=1 +short A "$t" 2>/dev/null
+      dig +time=2 +tries=1 +short AAAA "$t" 2>/dev/null
+    } | awk 'NF && $1 !~ /^;/' | head -n 4 | tr '\n' ' '
+    return
+  fi
+  printf '%s' "(由 ping/mtr 自行解析)"
+}
+
+quality_ping_stats() {
+  local target="$1" count="$2" fam="$3"
+  local args=()
+  [[ "$fam" == "6" ]] && args+=(-6)
+  args+=(-c "$count" -W 2 -i "$(quality_ping_iv)" -n "$target")
+  ping "${args[@]}" 2>/dev/null | awk '
+    /packet loss/ {
+      for (i = 1; i <= NF; i++) {
+        if ($i ~ /%/) {
+          loss = $i
+          gsub(/[^0-9.]/, "", loss)
+        }
+      }
+    }
+    /rtt min/ || /round-trip/ {
+      split($4, a, "/")
+      min=a[1]; avg=a[2]; max=a[3]; mdev=a[4]
+    }
+    END {
+      if (loss == "") loss="100"
+      if (min == "") min="-"
+      if (avg == "") avg="-"
+      if (max == "") max="-"
+      if (mdev == "") mdev="-"
+      printf "%s %s %s %s %s", loss, min, avg, max, mdev
+    }'
+}
+
+quality_tcp_ms() {
+  local ip="$1" port="$2"
+  local url extra=() sec start end ms
+  if have curl; then
+    if is_ipv6_addr "$ip"; then
+      extra+=(-6)
+      url="telnet://[${ip}]:${port}"
+    elif is_ipv4_addr "$ip"; then
+      extra+=(-4)
+      url="telnet://${ip}:${port}"
+    else
+      url="telnet://${ip}:${port}"
+    fi
+    sec=$(curl "${extra[@]}" -sS -o /dev/null --connect-timeout 3 --max-time 4 \
+      -w '%{time_connect}' "$url" 2>/dev/null || true)
+    if [[ -n "$sec" ]] && awk_gt "$sec" 0 && awk_gt 3.5 "$sec"; then
+      awk -v n="$sec" 'BEGIN { printf "%.0f", (n + 0) * 1000 }'
+      return 0
+    fi
+  fi
+  if ! is_ipv6_addr "$ip" && have timeout; then
+    start=$(date +%s%N 2>/dev/null || echo 0)
+    if timeout 4 bash -c "exec 3<>/dev/tcp/${ip}/${port} && exec 3>&-" 2>/dev/null; then
+      end=$(date +%s%N 2>/dev/null || echo 0)
+      if [[ "$start" == "0" || "$end" == "0" ]]; then
+        echo "ok"
+        return 0
+      fi
+      ms=$(awk -v s="$start" -v e="$end" 'BEGIN{printf "%.0f", (e-s)/1000000}')
+      echo "$ms"
+      return 0
+    fi
+  fi
+  echo "fail"
+  return 1
+}
+
+quality_tcp_stats() {
+  local ip="$1"
+  local port p i ms
+  local times=()
+  for port in 443 80; do
+    times=()
+    ms=$(quality_tcp_ms "$ip" "$port")
+    if [[ "$ms" == "fail" ]]; then
+      continue
+    fi
+    [[ "$ms" != "ok" ]] && times+=("$ms")
+    for i in 2 3 4 5; do
+      ms=$(quality_tcp_ms "$ip" "$port")
+      if [[ "$ms" != "fail" && "$ms" != "ok" ]]; then
+        times+=("$ms")
+      fi
+    done
+    if [[ ${#times[@]} -eq 0 ]]; then
+      echo "$port ok - - -"
+      return 0
+    fi
+    p=$(printf '%s\n' "${times[@]}" | awk '
+      NR==1 { min=$1; max=$1; s=$1; n=1; next }
+      { if ($1+0<min) min=$1; if ($1+0>max) max=$1; s+=$1; n++ }
+      END { if (n<1) print "- - -"; else printf "%.0f %.0f %.0f", min, s/n, max }
+    ')
+    echo "$port ${#times[@]} $p"
+    return 0
+  done
+  echo "fail"
+  return 1
+}
+
+quality_run_mtr() {
+  local target="$1" fam="$2" proto="$3"
+  local args=(-n -r -c "$QUALITY_COUNT" -w -m 24)
+  local out
+  [[ "$(id -u)" -eq 0 ]] && args+=(-i "$(quality_mtr_iv)")
+  [[ "$fam" == "6" ]] && args+=(-6)
+  [[ "$fam" == "4" ]] && args+=(-4)
+  if [[ "$proto" == "tcp" ]]; then
+    args+=(--tcp -P 443)
+  fi
+  out=$(mtr "${args[@]}" "$target" 2>/dev/null) || out=""
+  if [[ -n "$out" ]]; then
+    printf '%s\n' "$out"
+    return 0
+  fi
+  mtr -n -r -c "$QUALITY_COUNT" "$target" 2>/dev/null || true
+}
+
+quality_parse_mtr() {
+  local out="$1"
+  printf '%s\n' "$out" | awk '
+    index($0, "|--") == 0 { next }
+    {
+      hops++
+      host=$2
+      loss=$3
+      gsub(/%/, "", loss)
+      avg=$6
+      if (hops == 1) first_loss = loss
+      last_host = host
+      last_loss = loss
+      last_avg = avg
+      if (host == "???" || host == "") {
+        star++
+        if (star > max_star) max_star = star
+      } else {
+        star = 0
+      }
+    }
+    END {
+      if (hops == 0) {
+        print "0 - - - - 0 0"
+        exit
+      }
+      dest_host = last_host
+      dest_loss = last_loss
+      dest_avg = last_avg
+      reached = (last_host != "" && last_host != "???") ? 1 : 0
+      if (first_loss == "") first_loss = "-"
+      if (dest_loss == "") dest_loss = "-"
+      if (dest_avg == "") dest_avg = "-"
+      if (dest_host == "") dest_host = "-"
+      if (max_star == "") max_star = 0
+      printf "%s %s %s %s %s %s %s", hops, first_loss, dest_host, dest_loss, dest_avg, reached, max_star
+    }'
+}
+
+quality_log_block() {
+  local line
+  while IFS= read -r line; do
+    log "  $line"
+  done
+}
+
+quality_one() {
+  local target="$1"
+  local fam resolved stats loss min avg max mdev
+  local tcp tcp_port tcp_n tcp_min tcp_avg tcp_max
+  local mtr_out parsed hops first_loss dest_host dest_loss dest_avg reached max_star
+  local proto="icmp" reached_txt="否" row_tcp="-" row_hops="-"
+
+  fam=$(quality_fam "$target")
+  resolved=$(quality_resolve "$target")
+
+  section "质量" "目标  $target"
+  info "解析: $resolved    探测 ${QUALITY_COUNT} 次"
+  if [[ "$fam" == "6" ]]; then
+    info "地址族: IPv6"
+  elif [[ "$fam" == "4" ]]; then
+    info "地址族: IPv4"
+  else
+    info "地址族: 按系统解析"
+  fi
+
+  printf "  %-10s %-8s %-10s %-10s %-10s %-10s\n" "方式" "丢包" "min" "avg" "max" "jitter"
+  [[ -n "$LOG" ]] && printf "  %-10s %-8s %-10s %-10s %-10s %-10s\n" "方式" "丢包" "min" "avg" "max" "jitter" >> "$LOG"
+
+  if have ping; then
+    stats=$(quality_ping_stats "$target" "$QUALITY_COUNT" "$fam")
+    loss=$(echo "$stats" | awk '{print $1}')
+    min=$(echo "$stats" | awk '{print $2}')
+    avg=$(echo "$stats" | awk '{print $3}')
+    max=$(echo "$stats" | awk '{print $4}')
+    mdev=$(echo "$stats" | awk '{print $5}')
+    [[ -z "$loss" ]] && loss="100"
+    [[ -z "$min" ]] && min="-"
+    [[ -z "$avg" ]] && avg="-"
+    [[ -z "$max" ]] && max="-"
+    [[ -z "$mdev" ]] && mdev="-"
+    printf "  %-10s %-8s %-10s %-10s %-10s %-10s\n" "ICMP" "${loss}%" "${min}ms" "${avg}ms" "${max}ms" "${mdev}ms"
+    [[ -n "$LOG" ]] && printf "  %-10s %-8s %-10s %-10s %-10s %-10s\n" "ICMP" "${loss}%" "${min}ms" "${avg}ms" "${max}ms" "${mdev}ms" >> "$LOG"
+  else
+    loss="100"
+    avg="-"
+    mdev="-"
+    warn "无 ping，跳过 ICMP"
+  fi
+
+  tcp=$(quality_tcp_stats "$target")
+  if [[ "$tcp" == "fail" ]]; then
+    printf "  %-10s %-8s %-10s %-10s %-10s %-10s\n" "TCP" "-" "-" "-" "-" "-"
+    [[ -n "$LOG" ]] && printf "  %-10s %-8s %-10s %-10s %-10s %-10s\n" "TCP" "-" "-" "-" "-" "-" >> "$LOG"
+    info "TCP 443/80 都连不上（目标可能没开这两个端口，不等于 ICMP 不通）"
+  else
+    tcp_port=$(echo "$tcp" | awk '{print $1}')
+    tcp_n=$(echo "$tcp" | awk '{print $2}')
+    tcp_min=$(echo "$tcp" | awk '{print $3}')
+    tcp_avg=$(echo "$tcp" | awk '{print $4}')
+    tcp_max=$(echo "$tcp" | awk '{print $5}')
+    if [[ "$tcp_avg" != "-" && -n "$tcp_avg" ]]; then
+      row_tcp="${tcp_avg}ms"
+    else
+      row_tcp="ok"
+    fi
+    printf "  %-10s %-8s %-10s %-10s %-10s %-10s\n" "TCP:${tcp_port}" "-" "${tcp_min}ms" "${tcp_avg}ms" "${tcp_max}ms" "-"
+    [[ -n "$LOG" ]] && printf "  %-10s %-8s %-10s %-10s %-10s %-10s\n" "TCP:${tcp_port}" "-" "${tcp_min}ms" "${tcp_avg}ms" "${tcp_max}ms" "-" >> "$LOG"
+    info "TCP 采样 ${tcp_n} 次（连上就算，不要求目标提供网页）"
+  fi
+
+  if [[ "$loss" == "100" && "$tcp" != "fail" ]]; then
+    proto="tcp"
+    info "ICMP 全丢，路由改走 TCP mtr（机房常禁 ping）"
+  fi
+
+  echo
+  if have mtr; then
+    info "路由质量 mtr (${proto}，${QUALITY_COUNT} 个周期)"
+    mtr_out=$(quality_run_mtr "$target" "$fam" "$proto")
+    if [[ -z "$mtr_out" ]]; then
+      warn "mtr 无输出"
+    else
+      printf '%s\n' "$mtr_out" | quality_log_block
+      parsed=$(quality_parse_mtr "$mtr_out")
+      hops=$(echo "$parsed" | awk '{print $1}')
+      first_loss=$(echo "$parsed" | awk '{print $2}')
+      dest_host=$(echo "$parsed" | awk '{print $3}')
+      dest_loss=$(echo "$parsed" | awk '{print $4}')
+      dest_avg=$(echo "$parsed" | awk '{print $5}')
+      reached=$(echo "$parsed" | awk '{print $6}')
+      max_star=$(echo "$parsed" | awk '{print $7}')
+      row_hops="$hops"
+      if [[ "$reached" == "1" ]]; then
+        reached_txt="是"
+        info "到达 ${dest_host}，共 ${hops} 跳；末跳丢包 ${dest_loss}%  均延 ${dest_avg}ms"
+      else
+        info "mtr 未见目标（${hops} 跳，末跳 ${dest_host}）"
+      fi
+      if [[ "$first_loss" != "-" ]] && awk_gt "$first_loss" 30; then
+        if [[ "$reached" != "1" || "$loss" == "100" ]] || { [[ "$dest_loss" != "-" ]] && awk_gt "$dest_loss" 30; }; then
+          fail "第一跳丢包 ${first_loss}%，本机网关或出网口有问题"
+        else
+          info "第一跳丢包 ${first_loss}% 但后面正常，多半是网关限 ICMP，可忽略"
+        fi
+      fi
+      if [[ "$reached" == "1" && "$dest_loss" != "-" ]] && awk_gt "$dest_loss" 5; then
+        warn "末跳丢包 ${dest_loss}%（这才是真丢包；中间跳的 Loss% 经常是假的）"
+      elif [[ "$reached" == "1" ]]; then
+        ok "末跳丢包正常（中间跳丢包多半是 hop 限 ICMP，可忽略）"
+      fi
+      if [[ "$reached" != "1" && "$max_star" != "-" ]] && awk_ge "$max_star" 5; then
+        warn "连续 ${max_star} 跳无响应，像中途黑洞或目标禁探测"
+      fi
+      if [[ "$hops" != "-" ]] && awk_ge "$hops" 18; then
+        warn "跳数 ${hops}，偏多，可能绕路"
+      fi
+    fi
+  elif have traceroute; then
+    local tr_args=(-n -q 3 -w 2 -m 20) tr_out
+    [[ "$fam" == "6" ]] && tr_args+=(-6)
+    info "无 mtr，traceroute -q 3（每跳 3 次，* 多为该跳禁 ICMP）"
+    tr_out=$(traceroute "${tr_args[@]}" "$target" 2>/dev/null || true)
+    if [[ -n "$tr_out" ]]; then
+      printf '%s\n' "$tr_out" | quality_log_block
+      hops=$(printf '%s\n' "$tr_out" | awk 'NF && $1 ~ /^[0-9]+$/{n=$1} END{print n+0}')
+      row_hops="${hops:-?}"
+      if printf '%s\n' "$tr_out" | grep -qE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+|:[0-9a-fA-F]'; then
+        reached_txt="是"
+      fi
+    fi
+    info "上面若大段 * * * 或跳数突然出国再绕回，说明路由质量差"
+  else
+    warn "无 mtr / traceroute，跳过路由"
+  fi
+
+  if [[ "$loss" == "100" && "$tcp" == "fail" ]]; then
+    fail "$target  ICMP 全丢且 TCP 443/80 不通"
+  elif [[ "$loss" == "100" && "$tcp" != "fail" ]]; then
+    warn "$target  ICMP 不通（可能禁 ping），TCP :${tcp_port} 约 ${tcp_avg}ms"
+  elif awk_gt "$loss" 20; then
+    fail "$target  丢包 ${loss}%（严重）  延迟 ${avg}ms"
+  elif awk_gt "$loss" 5; then
+    warn "$target  丢包 ${loss}%  延迟 ${avg}ms"
+  elif [[ "$avg" != "-" ]] && awk_gt "$avg" 200; then
+    warn "$target  延迟 ${avg}ms，偏高  丢包 ${loss}%"
+  elif [[ "$mdev" != "-" ]] && awk_gt "$mdev" 50; then
+    warn "$target  抖动 ${mdev}ms，不稳定  延迟 ${avg}ms  丢包 ${loss}%"
+  else
+    ok "$target  延迟 ${avg}ms  丢包 ${loss}%  抖动 ${mdev}ms"
+  fi
+
+  QUALITY_ROWS+=("$target|${loss}%|${avg}ms|${mdev}ms|${row_tcp}|${row_hops}|${reached_txt}")
+}
+
+run_quality() {
+  section "质量" "指定目标：路由 / 延迟 / 丢包（不替代网络体检）"
+  info "测的是本机到这些 IP 的出网质量。中间跳 Loss% 常被限速，以 ping 末跳 / 目标丢包为准。"
+  DEFAULT_IFACE=$(detect_wan_iface)
+  [[ -n "$DEFAULT_IFACE" ]] && info "默认出网网卡: $DEFAULT_IFACE"
+  if have ip; then
+    ip route 2>/dev/null | awk '/^default/{print}' | while IFS= read -r line; do
+      info "默认路由: $line"
+    done
+  fi
+
+  QUALITY_ROWS=()
+  local t
+  for t in "${QUALITY_TARGETS[@]}"; do
+    quality_one "$t"
+  done
+
+  hr
+  logc "${BLD}质量汇总${RST}"
+  printf "  %-22s %-8s %-10s %-10s %-10s %-8s %-6s\n" "目标" "丢包" "ICMP均延" "抖动" "TCP均延" "跳数" "到达"
+  [[ -n "$LOG" ]] && printf "  %-22s %-8s %-10s %-10s %-10s %-8s %-6s\n" "目标" "丢包" "ICMP均延" "抖动" "TCP均延" "跳数" "到达" >> "$LOG"
+  local row
+  for row in "${QUALITY_ROWS[@]}"; do
+    IFS='|' read -r t loss avg mdev tcp hops reached <<< "$row"
+    printf "  %-22s %-8s %-10s %-10s %-10s %-8s %-6s\n" "$t" "$loss" "$avg" "$mdev" "$tcp" "$hops" "$reached"
+    [[ -n "$LOG" ]] && printf "  %-22s %-8s %-10s %-10s %-10s %-8s %-6s\n" "$t" "$loss" "$avg" "$mdev" "$tcp" "$hops" "$reached" >> "$LOG"
+  done
+
+  hr
+  logc "${BLD}怎么看网络质量${RST}"
+  info "• 丢包：看 ping 和 mtr 末跳。中间跳的 Loss% 经常是假的（设备限 ICMP）"
+  info "• 延迟：看 ICMP avg；和 TCP 差很多时，以能通的那一侧为准"
+  info "• 抖动大：排队、无线回程或不稳的国际线路，表现为时快时慢"
+  info "• 路由：跳数突然很多、回国再出国、或连续 ??? = 绕路/黑洞"
+  info "• ICMP 全丢但 TCP 正常 = 机房禁 ping，不是目标挂了"
+}
+
 # ---------- traceroute ----------
 check_route() {
   section "11" "路由追踪（看是否绕路/中途丢包）"
@@ -1750,6 +2280,7 @@ summarize() {
   info "5) 到某网段绕路 → 表里只有某几个站 TCP/TLS 特别慢"
   info "6) 入口线路问题 → 本机体检全绿，但用户走代理仍卡（本脚本测不到）"
   info "7) Telegram 慢  → 菜单选「只测 Telegram」，对照 Cloudflare 和五个 DC"
+  info "8) 到某几个 IP 差 → 菜单选「指定 IP 网络质量」，或 --quality-only 1.1.1.1,8.8.8.8"
   hr
   logc "完整日志: ${LOG}"
   logc "下次直接 bash $0 进入菜单。命令行例子: bash $0 --telegram-only"
@@ -1759,6 +2290,16 @@ summarize() {
 main() {
   LOG="/tmp/vps-netcheck-$(date +%Y%m%d-%H%M%S).log"
   : > "$LOG"
+
+  if [[ $QUALITY_ONLY -eq 1 ]]; then
+    logc "${BLD}指定 IP 网络质量 v${VERSION}${RST}  次数=${QUALITY_COUNT}  $(ts)"
+    info "独立于网络体检：只测到指定目标的路由、延迟、丢包。"
+    ensure_quality_deps
+    run_quality
+    run_requested_fixes
+    logc "完整日志: ${LOG}"
+    return 0
+  fi
 
   logc "${BLD}VPS 出网体检 v${VERSION}${RST}  模式=${MODE}  $(ts)"
   info "测的是「这台 VPS 自己访问外网」，不是用户穿过节点的体感。"
@@ -1806,6 +2347,7 @@ main() {
     check_route
   fi
   check_conntrack
+  [[ $QUALITY -eq 1 ]] && run_quality
   [[ $TELEGRAM -eq 1 ]] && check_telegram
   summarize
   [[ $UNLOCK -eq 1 ]] && run_unlock
