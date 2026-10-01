@@ -2,8 +2,8 @@
 # One-command Debian/Ubuntu bootstrap. The reviewed payload is pinned below.
 set -euo pipefail
 
-V2_COMMIT='067a55a88c0e8daf6bb7213b1e90dcf918654b1b'
-V2_SHA256='ac7e9fe500ca14bdef864d1ff6b8e009987f27f280ab026eb0fdcc2738bddcfb'
+V2_COMMIT='ef9376328452e022d96797bb8e148d63ceb18b79'
+V2_SHA256='718658a45692c5d2751c0e997bd4911c6b375b20ddd0d5239b44b745617a40f2'
 V2_TEMP=''
 
 v2_cleanup() {
