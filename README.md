@@ -14,6 +14,16 @@
 
 ## 使用 v2
 
+Debian/Ubuntu 可以像 v1 一样一行启动；这个启动入口会自动安装缺失依赖、下载并校验固定版本的 v2，然后在交互终端打开菜单：
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/M3DaLou/inonescripts/codex/vps-netcheck-v2/v2.sh)
+```
+
+普通用户缺依赖时会通过 sudo 安装；已是 root 则直接安装。需要已存在 curl 来获取启动入口。
+自动安装是 `v2.sh` 的行为，直接运行 `vps-netcheck-v2.sh` 仍不会自动安装。
+无交互终端时使用默认检测；也可在同一行最后加 `--quick`、`--full`、`--telegram-only` 等参数。
+
 从仓库取得脚本后，在 Linux 上执行：
 
 ```bash
@@ -66,6 +76,7 @@ src/netcheck.py          v2 检测和 CLI
 src/netcheck_repair.py   显式修复、前态保存、提交与回滚
 tests/                  自动化测试与 v1 缺陷复现
 build.py                生成单文件 Bash 及 SHA256SUMS
+v2.sh                   自动准备依赖的一行启动入口
 vps-netcheck-v2.sh       纳入 Git 的 v2 发布入口
 vps-netcheck.sh          保留的 v1.5.0 入口
 docs/                   使用说明、原版审查及验证记录
@@ -73,6 +84,7 @@ docs/                   使用说明、原版审查及验证记录
 
 修改 `src/` 后重新构建，并把源码、生成的脚本和校验和一起提交。
 不要直接修改生成文件 `vps-netcheck-v2.sh`。
+`v2.sh` 固定了已发布负载的 commit 和 SHA-256；发布新负载后须同步更新这两个常量，避免启动入口仍指向旧版。
 
 ```bash
 python3 -m unittest discover -s tests -v

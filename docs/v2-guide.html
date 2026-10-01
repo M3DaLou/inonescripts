@@ -4,6 +4,8 @@
 <p class="notice"><strong>这是候选版本：</strong>51 项自动化测试通过，其中 5 项使用真实 curl 访问本机受控 HTTP 服务。Bash 语法、发布包启动和源码编译已检查。当前环境是 Windows，Linux systemd、iptables、真实双栈及 SSH 回滚尚未完成集成验证。先在测试 VPS 验证，尤其不要直接把修复功能视为生产验收完成。</p>
 <p><a href="v1-audit.html">查看原版完整审查（32 项问题）</a> · <a href="../vps-netcheck-v2.sh">新版单文件</a> · <a href="verification.md">新版测试记录</a> · <a href="../SHA256SUMS">SHA-256</a></p>
 <h2>快速开始</h2>
+<p>Debian/Ubuntu 一行启动：自动安装缺失依赖、下载并校验固定版本，交互终端里打开菜单。非 root 用户安装时需要 sudo；获取启动入口需要已有 curl。</p>
+<pre>bash &lt;(curl -fsSL https://raw.githubusercontent.com/M3DaLou/inonescripts/codex/vps-netcheck-v2/v2.sh)</pre>
 <p>将 <code>vps-netcheck-v2.sh</code> 下载到 Linux VPS 后运行：</p>
 <pre>bash vps-netcheck-v2.sh --help
 bash vps-netcheck-v2.sh --quick
