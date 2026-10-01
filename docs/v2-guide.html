@@ -1,0 +1,82 @@
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>VPS Netcheck v2 使用说明</title><style>body{max-width:960px;margin:40px auto;padding:0 24px;font:16px/1.8 system-ui,"Microsoft YaHei",sans-serif;color:#203444}h1{line-height:1.3}h2{margin-top:36px;border-bottom:1px solid #cbd8df}pre{background:#edf3f7;padding:18px;white-space:pre-wrap;overflow-wrap:anywhere}code{font-family:Consolas,monospace}table{border-collapse:collapse;width:100%}td,th{border:1px solid #cad6de;padding:10px;text-align:left}a{color:#096a98}.notice{background:#fff5df;padding:16px;border-left:4px solid #bc8218}</style></head><body>
+<h1>VPS Netcheck 2.0.0-rc1</h1>
+<p>基于原版 v1.5.0 审查后重新实现。交付单个可运行 Bash 文件，同时提供可维护的 Python 源码、构建工具、审查报告与测试。</p>
+<p class="notice"><strong>这是候选版本：</strong>51 项自动化测试通过，其中 5 项使用真实 curl 访问本机受控 HTTP 服务。Bash 语法、发布包启动和源码编译已检查。当前环境是 Windows，Linux systemd、iptables、真实双栈及 SSH 回滚尚未完成集成验证。先在测试 VPS 验证，尤其不要直接把修复功能视为生产验收完成。</p>
+<p><a href="v1-audit.html">查看原版完整审查（32 项问题）</a> · <a href="../vps-netcheck-v2.sh">新版单文件</a> · <a href="verification.md">新版测试记录</a> · <a href="../SHA256SUMS">SHA-256</a></p>
+<h2>快速开始</h2>
+<p>将 <code>vps-netcheck-v2.sh</code> 下载到 Linux VPS 后运行：</p>
+<pre>bash vps-netcheck-v2.sh --help
+bash vps-netcheck-v2.sh --quick
+bash vps-netcheck-v2.sh --family 0 --full --deadline 300
+bash vps-netcheck-v2.sh --interactive</pre>
+<p>无参数运行默认体检，不自动进入菜单。默认 IPv4；<code>--family 0</code> 为双栈。检测默认不需要 root，也不自动安装软件。ping/mtr 的权限由发行版的 capability/setuid 配置决定，权限不足会保留错误。</p>
+<h2>依赖与平台</h2>
+<ul><li>Linux、Bash、Python 3.8+；Python 只使用标准库，无 pip 依赖。</li><li>HTTP 检测需要 curl 7.63+（stderr write-out）；建议使用发行版维护版本。旧版 curl 的流式下载大小限制不足，由 Python 的有界读取补充限制。</li><li>iproute2（ip/ss）、iputils-ping；mtr 用于质量路由，缺失则跳过，不以 traceroute 标题猜测到达目标。</li><li>指定 DNS 需要 dig（Debian/Ubuntu 的 dnsutils）。系统解析通过隔离的 getaddrinfo 子进程进行。</li><li>应用可回滚修复需要 root、systemd 和 systemd-run；MSS 需要 iptables；NTP/缓存动作需要对应已有工具。</li></ul>
+<p>需要安装时，可由管理员显式执行（这会修改系统软件包）：</p>
+<pre>sudo apt-get update
+sudo apt-get install python3 curl iproute2 iputils-ping dnsutils mtr-tiny ca-certificates</pre>
+<h2>常用检测</h2>
+<pre># 明确目标端口，保留失败次数
+bash vps-netcheck-v2.sh --quality-only 1.1.1.1,example.com --port 443 --count 20 --deadline 300
+
+# 指定 DNS：按列表查询，失败不会静默回退到系统 DNS
+bash vps-netcheck-v2.sh --quick --dns 1.1.1.1,8.8.8.8 --url https://example.com:8443/
+
+# IPv6
+bash vps-netcheck-v2.sh --family 6 --quality-only 2606:4700:4700::1111
+
+# 显式接口（可能需要权限），或使用 --source 绑定源地址，二者互斥
+bash vps-netcheck-v2.sh --interface eth0 --quick
+
+# 显式代理；不混入直连 ping/TCP/mtr，且不与 --dns 同时使用
+bash vps-netcheck-v2.sh --quick --proxy socks5h://127.0.0.1:1080
+
+# 下载测速默认关闭，需要显式启用
+bash vps-netcheck-v2.sh --speed --speed-mb 5 --max-download-mb 30
+
+# Telegram 官网与历史入口 TCP，不下载整个安装包
+bash vps-netcheck-v2.sh --telegram-only
+
+# 输出目录；--file 可读一行一个 URL，只有整行 # 是注释
+bash vps-netcheck-v2.sh --quick --output ./reports --file urls.txt</pre>
+<p><code>--quality-count</code> 是 <code>--count</code> 的兼容别名；<code>--unlock-ip</code> 是 <code>--family</code> 的别名。<code>--no-install</code> 可继续使用，但新版始终不安装依赖。其他旧修复参数改为下面的显式事务接口；无法识别的参数会报错。</p>
+<h2>结果如何解释</h2>
+<table><tr><th>状态</th><th>含义</th></tr><tr><td>PASS</td><td>该项操作获得预期证据；不意味着所有业务都正常。</td></tr><tr><td>WARN</td><td>有异常观察，如 HTTP 403、部分连接失败；不自动推导封 IP/线路故障。</td></tr><tr><td>FAIL</td><td>具体探测或校验失败，保留退出码及原始错误；不等同整台 VPS 网络故障。</td></tr><tr><td>UNKNOWN</td><td>证据不足、无解析结果或无法确认到达，不能当作成功或 0 延迟。</td></tr><tr><td>SKIP</td><td>缺依赖、代理模式不适用、预算用尽等原因未执行。</td></tr></table>
+<p>退出码：<code>0</code> 已完成且没有 FAIL/UNKNOWN/SKIP（仍可能有 WARN）；<code>1</code> 含失败；<code>2</code> 参数/运行平台错误；<code>3</code> 检测不完整或有未知/跳过；<code>4</code> 修复未成功；<code>130</code> 用户中断。失败优先于不完整。</p>
+<p>每轮创建私有随机目录，输出 <code>report.json</code> 与 <code>report.txt</code>。JSON 含工具原始输出、统计、具体 IP、地址族及解析证据。终端移除控制字符，目标 URL 的 query 在展示时隐去；<strong>完整 JSON 仍可能在重定向或原始错误中含敏感 URL/IP，不是可自动公开分享的脱敏报告。</strong></p>
+<h2>修复：先计划，再应用，再提交</h2>
+<pre># 查看 MTU 计划，不改系统；必须明确给出数值
+bash vps-netcheck-v2.sh --repair mtu --interface eth0 --value 1400
+
+# 应用后 120 秒自动回滚；--yes 仅免交互确认，不提交事务
+sudo bash vps-netcheck-v2.sh --repair mtu --interface eth0 --value 1400 --apply --rollback-after 120
+
+# 命令会打印真实 RUN_ID。检查 SSH 与业务连接后，再单独提交
+sudo bash vps-netcheck-v2.sh --commit RUN_ID
+
+# 或立即回滚未提交事务
+sudo bash vps-netcheck-v2.sh --rollback RUN_ID</pre>
+<table><tr><th>动作</th><th>示例及边界</th></tr><tr><td>mtu</td><td><code>--repair mtu --interface eth0 --value 1400</code>。仅运行时；不会写持久化服务，也不会猜测恢复值。</td></tr><tr><td>dns</td><td><code>--repair dns --value 1.1.1.1,8.8.8.8</code>。仅静态普通 resolv.conf；符号链接、活动管理器或文件标注托管时拒绝覆盖。</td></tr><tr><td>ipv4-prefer</td><td><code>--repair ipv4-prefer</code>。保存原文件并补完整 precedence 表；已有自定义策略时拒绝自动合并。不会关闭 IPv6。</td></tr><tr><td>mss</td><td><code>--repair mss</code>。仅 IPv4 运行时 OUTPUT/FORWARD 规则；事务专属 comment，不删除其他人同类规则。</td></tr><tr><td>ntp</td><td><code>--repair ntp</code>。启用已有 NTP 能力；确认启用不等于已完成时钟同步，不安装/替换服务。</td></tr><tr><td>flush-dns</td><td><code>--repair flush-dns --apply</code>。通过 resolvectl 刷新缓存；这是无法恢复缓存内容的瞬时动作，不创建伪回滚承诺。</td></tr></table>
+<p>每次只允许一个未完成事务。修改前保存实际字节、权限、属主或运行时数值；先创建独立 systemd 回滚计时器，再修改与本地验证。回滚发现其他人修改过目标时会拒绝覆盖并记录 rollback_failed。状态位于 <code>/var/lib/vps-netcheck</code>。</p>
+<p><strong>定时回滚以系统持续运行、systemd 可用为前提；本版计时器不是跨重启的持久事务管理器。</strong>不要在 pending 阶段重启。重启后可读取事务文件并显式执行 --rollback。提交会取消待执行回滚；已提交事务不接受盲目撤销，应重新规划。MTU/MSS 提交后仍不会在重启后自动重建。</p>
+<h2>流媒体：显式提供已审查依赖</h2>
+<pre>bash vps-netcheck-v2.sh --unlock-only \
+  --unlock-script ./reviewed-check.sh \
+  --unlock-sha256 实际64位SHA256 \
+  --unlock-region 0 --unlock-timeout 180 --deadline 240</pre>
+<p>以普通用户运行。新版不会下载可变 main，也不会以 root 执行外部检测。顶层哈希不能证明运行时下载的其他脚本可信；应审查并固定完整执行链。仅提供官方 check.sh 快照不足以解决它内部继续下载代码的问题。第三方不服从本工具的网络/字节预算，因此该模块独立标注，只有总执行时限。</p>
+<h2>有意保留的限制与下一步</h2>
+<ul><li>当前 HTTP 只测首个响应，不自动跟随重定向；会记录 redirect_url。这样不会把跨域重定向偷偷切回系统 DNS。下一步可实现逐跳显式解析与同一策略重放。</li><li>默认每域名每地址族选一个 IP，缓存本次解析以保持目标一致；未穷举 CDN 所有后端。</li><li>PMTU 是多个尺寸的采样下界，不是完整二分搜索，也不据此修改网卡 MTU。</li><li>下载预算是本工具 HTTP 正文的应用层预算，不含 TCP/TLS/HTTP 头、重传、DNS、第三方脚本。停止阈值存在最多一个读取块及系统缓冲导致的在途流量；不是运营商计费的精确上限。并发任务预留最坏字节，不回收未用额度，因此可能保守跳过后续任务。</li><li>下载测速单源、单连接、默认一次，不声称测到最大带宽；没有上传测速、端到端回程或中国三网线路等级判定。</li><li>Telegram 使用明确标注为历史静态的 IPv4 入口，未实现实时 DC 发现/MTProto 认证/媒体播放，不能排除全球服务故障。</li><li>本版不持久修改网卡 MTU/MSS，不自动关闭 IPv6，不自动修改 NetworkManager/networkd 配置。这些需要独立的发行版集成测试后再开放。</li><li>未实现完整报告脱敏副本、历史趋势、DNSSEC/DoH/DoT/HTTP3、自动 NTP 偏差量测；详见审查报告中的后续路线。</li></ul>
+<h2>开发、构建与验证</h2>
+<pre># 源码入口，可直接开发运行
+python3 src/netcheck.py --help
+
+# 离线回归 + 本机 HTTP 集成；不访问外部网络，不改系统
+python3 -m unittest discover -s tests -v
+
+# 从模块重新生成单文件 Bash 发布物及校验和
+python3 build.py
+bash -n vps-netcheck-v2.sh
+sha256sum -c SHA256SUMS</pre>
+<p>测试目录中修改文件仅限临时目录，系统修改命令使用 mock。原版复现脚本 <code>tests/reproduce_v1.sh</code> 另测 15 项原版缺陷，不要把其 REPRODUCED 当作新版通过数。审查快照的来源/哈希写在审查报告中，源项目的许可与再分发要求需在公开发布前核对。</p>
+</body></html>

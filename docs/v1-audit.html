@@ -1,0 +1,129 @@
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>VPS Netcheck v1.5.0 全面审查与改进方案</title>
+<style>body{font:16px/1.8 system-ui,"Microsoft YaHei",sans-serif;color:#192b39;background:#f3f6f8;margin:0}main{max-width:1080px;margin:auto;background:white;padding:48px}h1{font-size:34px;line-height:1.3}h2{margin-top:48px;border-top:2px solid #d9e5eb;padding-top:22px}h3{margin-top:28px}a{color:#096a98}code,pre{font-family:Consolas,monospace;font-size:.9em;background:#edf3f6}code{padding:2px 5px;overflow-wrap:anywhere}pre{padding:18px;white-space:pre-wrap;overflow-wrap:anywhere}table{border-collapse:collapse;width:100%;margin:18px 0;font-size:14px}td,th{border:1px solid #d8e1e7;padding:11px;text-align:left;vertical-align:top}th{background:#edf3f6}.lead{border-left:5px solid #147da1;background:#edf7fa;padding:18px}.muted{color:#526778}.tag{font-weight:bold;color:#a23825}li{margin:7px 0}@media(max-width:700px){main{padding:20px}table{display:block;overflow:auto}h1{font-size:27px}}@media print{body{background:white}main{padding:0}h2,h3{break-after:avoid}tr{break-inside:avoid}a{color:inherit}}</style></head>
+<body><main>
+<p class="muted">源码审查 / 2026-10-01 / 面向下一版开发</p>
+<h1>VPS Netcheck v1.5.0<br>全面审查与改进方案</h1>
+<p class="lead"><strong>结论：</strong>脚本覆盖面不错，适合作为人工排障入口；当前主要短板是证据保存、故障归因与系统修改的可靠性。全面改进应先修正误判和修复机制，再扩展检测项目。现版本不宜作为无人值守自动修复工具。</p>
+<p>本报告记录原版审查、可复现缺陷与完整开发路线。后续已据此实现 v2 候选版本，具体已实现范围、测试及保留限制见<a href="v2-guide.html">新版使用说明</a>；下文路线并非全部已实现。没有在生产 VPS 上执行原脚本，也没有执行真实系统修复或第三方检测代码。</p>
+<h2>1. 审查基线与验证范围</h2>
+<ul><li>源文件：<a href="https://github.com/M3DaLou/inonescripts/blob/306fb79025c791dd0e28118cedc82b46c2bad112/vps-netcheck.sh">固定 commit 的 vps-netcheck.sh</a>，2,357 行，76,126 字节，内部版本 1.5.0。</li>
+<li>Commit：<code>306fb79025c791dd0e28118cedc82b46c2bad112</code>。固定 commit 文件与本次下载的 main 文件 SHA-256 一致。</li>
+<li>SHA-256：<code>ab3afb0e4d09b025ba11c3aff1876a12979bd921760f1e51729a5e03a5fb3a01</code>。</li>
+<li>完成逐段静态审查；Git Bash 5.2.37 下 <code>bash -n</code> 通过；15 项隔离复现全部成功。测试结果中的 REPRODUCED 表示<strong>原版缺陷被复现</strong>，不表示已经修好。</li>
+<li>隔离复现替换 curl、ping、ip 等命令或使用固定文本；没有真实网络探测，也没有系统配置写入。它验证控制流与解析逻辑，不能替代 Linux 集成测试。</li>
+<li>抽查被调用的 RegionRestrictionCheck 当前源码，发现它还会下载执行其他远程脚本；未全面审计这一第三方项目。</li></ul>
+<p>本地附件：<a href="../vps-netcheck.sh">原版快照</a> · <a href="../tests/reproduce_v1.sh">隔离复现脚本</a> · <a href="v1-reproductions.txt">测试记录</a>。在副本目录运行 <code>bash tests/reproduce_v1.sh</code>；测试会在<code>tests/test-work</code> 中创建夹具。</p>
+<h2>2. 现有设计：值得保留什么</h2>
+<table><tr><th>模块</th><th>当前实现</th><th>评价</th></tr>
+<tr><td>交互 / CLI</td><td>菜单、quick/full、指定 URL / DNS / IP、独立检测模式</td><td>入口友好，但解析、校验与执行计划需要统一。</td></tr>
+<tr><td>基础排障</td><td>系统负载、时间、地址、DNS、ICMP、MTU、IPv6、端口、HTTPS</td><td>排障顺序合理；多数问题来自判断逻辑过强、证据太少。</td></tr>
+<tr><td>网络质量</td><td>ping、TCP 建连、多跳 mtr / traceroute</td><td>很有价值，应保留并优先修复目标识别及采样统计。</td></tr>
+<tr><td>专项检测</td><td>下载测速、Telegram、第三方流媒体</td><td>适合可选模块，需要明确数据来源、测量范围和费用预算。</td></tr>
+<tr><td>修复</td><td>IPv6、MTU、DNS、gai.conf、MSS、NTP、DNS 缓存</td><td>独立确认机制值得保留；回滚、错误传播、系统管理器识别不足。</td></tr>
+<tr><td>实现习惯</td><td>函数分区、部分数组引用、部分超时、HTTPS 并发五路、临时目录</td><td>可作为重构基础。无需为了“全面”直接换语言或全部推倒。</td></tr></table>
+<h2>3. 应优先修复的缺陷</h2>
+<p>下面的 P1 表示进入生产自动化前应优先解决；P2 表示准确性、可靠性或兼容性问题；P3 表示体验及维护改进。优先级是工程排序，不是 CVSS 漏洞评分。行号均对应固定快照。</p>
+<table><tr><th>ID / 优先级</th><th>位置</th><th>证据、后果与改法</th></tr>
+<tr><td>F01 / P1</td><td>989–1028<br>2190–2206</td><td><strong>IPv6 误判会进入修复链。</strong>ping6 失败立即设置 IPV6_BROKEN=1，HTTPS 成功后没有清除；HTTP 403 也当网络故障。两种场景均已复现。应分别记录 ICMP、TCP、TLS、HTTP 状态；HTTPS 可达但拒绝访问时不能推出 IPv6 故障，更不能触发关闭 IPv6。</td></tr>
+<tr><td>F02 / P1</td><td>2194–2206</td><td><strong>“或者关闭 IPv6”实际上不是二选一。</strong>两个独立 if 在 <code>--fix --yes</code> 下依次执行 IPv4 优先与关闭 IPv6，已复现。应生成互斥动作方案；自动应用只允许用户显式列出的动作。已有 IPv6 SSH 会话需检查并支持延时回滚。</td></tr>
+<tr><td>F03 / P1</td><td>2001–2027</td><td><strong>DNS 备份可能只是链接。</strong><code>cp -a /etc/resolv.conf backup</code> 对符号链接保留链接，随后写原链接目标，备份也可能指向被修改内容。resolvectl 分支失败被忽略后仍报成功，且运行时接口配置不能直接承诺永久生效。应保存链接拓扑和目标字节内容，识别 resolved / NetworkManager / networkd / resolvconf / 静态文件，采用对应配置接口并验证。</td></tr>
+<tr><td>F04 / P1</td><td>1931–1963<br>1966–1998<br>2126–2142</td><td><strong>撤销并不等于恢复原状。</strong>undo IPv6 把所有接口设为启用，不知道原状态；MTU 提示恢复到 1500，不知道原值；MSS 添加时跳过已有同样规则，撤销却仍删除它。应逐项保存前态、记录本次真正创建的资源，回滚只处理自己拥有的变更，并检测外部并发修改。</td></tr>
+<tr><td>F05 / P1</td><td>1938–1949<br>1994–1998<br>2011–2013<br>2081–2123<br>2150–2166</td><td><strong>关键写入或命令失败后仍显示 OK。</strong>sysctl、systemctl、resolvectl、iptables、NTP 多处忽略错误。<code>set -uo pipefail</code> 不会自动使这些路径失败退出。修复需要逐步检查返回码、读取回验证状态、失败回滚；不要只机械加 <code>set -e</code>。</td></tr>
+<tr><td>F06 / P1</td><td>205<br>1897–1908</td><td><strong>解锁区域 CLI 缺少校验，且拼接进 bash -c。</strong>菜单会校验区域，CLI 不会；无效区域通过解析已复现。当带指定 DNS、root、unshare 分支时，区域字符串进入嵌套单引号命令，可被引号突破。风险前提是调用方把不可信区域输入交给高权限脚本，并非远程服务可直接利用。应统一白名单验证，使用位置参数传值，禁止动态输入拼接 shell 程序。</td></tr>
+<tr><td>F07 / P1</td><td>1838–1839<br>1874–1917</td><td><strong>远程执行链不可复现。</strong>下载可变 main 或备用域名内容后以当前权限执行，没有固定版本、可信校验、运行总时限；第三方失败后仍显示“结束”OK。当前外部 check.sh 在约 5959–5981 行还会下载执行其他脚本，因此仅固定第一层不够。应固定并审查依赖链、记录摘要、降低执行权限、检查所有状态；挂载命名空间只隔离挂载视图，不能充当第三方代码安全沙箱。</td></tr>
+<tr><td>F08 / P1</td><td>2291–2292</td><td><strong>日志文件可预测且未显式保护。</strong>秒级 /tmp 文件名有并发冲突、预置链接与权限暴露风险；实际链接攻击是否成功取决于内核保护和目录权限，不能一概称为必然 root 覆写。改成私有随机目录、umask 077、唯一 run_id，并支持用户指定安全输出目录。</td></tr>
+<tr><td>F09 / P1</td><td>1570–1605<br>1732–1738</td><td><strong>“到达目标”判断错误。</strong>mtr 只判断末行 host 非 ???；traceroute 只搜索任意 IP，连标题里的目标 IP 都算成功。均已复现。先固定实际目标地址，再对比响应节点及协议结束条件；未到达时不得把最后中间跳的 Loss% 当目标丢包。</td></tr>
+<tr><td>F10 / P1</td><td>1090–1094<br>1207–1209<br>1265–1267<br>2333–2355</td><td><strong>错误证据与退出语义丢失。</strong>curl 非零退出被全零替代，DNS 失败、超时、证书错误和连接拒绝无法区分；缺 curl 时 main 仍继续；一般 FAIL 也不影响最终成功退出。证书错误数据丢失及 FAIL 后退出 0 已复现。保留原输出、stderr、退出码；区分探测失败、依赖不足与系统故障，定义稳定的进程退出码。</td></tr>
+</table>
+<h2>4. 检测准确性与性能问题</h2>
+<table><tr><th>ID</th><th>位置</th><th>问题与改法</th></tr>
+<tr><td>F11 / P2</td><td>715–736</td><td>Cloudflare 身份请求未强制 -4，却直接赋值 PUBLIC_V4；可能把 IPv6 打印成公网 IPv4。按地址族分别请求并验证返回值；IPv6-only 不能天然判为故障。IP、ASN、地理位置和实际出口需绑定同一次测量。</td></tr>
+<tr><td>F12 / P2</td><td>581–582</td><td>用默认路由第 5 列识别网卡，对 <code>default dev ppp0 scope link</code> 得到 link，已复现。多出口、策略路由也不能用第一条 default 概括。对实际目标执行 <code>ip -j route get</code>，保存 dev、src、gateway、table，并支持显式接口/源地址。</td></tr>
+<tr><td>F13 / P2</td><td>156–169<br>198–202<br>480<br>1967–1988</td><td>IPv4 只匹配形状，IPv6 只要冒号，999.999.999.999 和 invalid:address 均通过；DNS、URL、MTU 缺完整校验。建立同一验证层，校验 IP 数值、域名标签、URL scheme/port、控制字符和 MTU 设备约束；数字按十进制规范化，避免前导零进入 Bash 算术产生歧义。</td></tr>
+<tr><td>F14 / P2</td><td>755–879</td><td>DNS 只测 A，CNAME 混入短输出；没有 RCODE、NOERROR/NODATA/NXDOMAIN/SERVFAIL、截断和 DNSSEC 信息。答案与时间来自两次不同查询，第二次可能已命中缓存。一次查询保存完整应答、时间和状态，分别测 A/AAAA，另做系统 NSS 解析测试。</td></tr>
+<tr><td>F15 / P2</td><td>783–789<br>840–867</td><td>私网答案直接归因为劫持，忽略 split DNS、内网代理、安全过滤和合法本地域名策略；不同公共 DNS 的 CDN 答案差异也不等于污染。保留“异常/需核实”状态，展示原答与对照，不自动推导修改系统 DNS。</td></tr>
+<tr><td>F16 / P2</td><td>1077–1093<br>1243–1254<br>692–693<br>1009–1012</td><td>--dns 主要只用第一服务器、A 记录、初始 hostname、80/443；自定义端口、IPv6 字面量、跨域重定向不完整；解析失败静默回退系统 DNS，已复现。身份、IPv6、测速等也未一致接入。应做统一解析/连接层，明确 DNS 策略与回退行为，记录真实 resolver、resolved_ip、remote_ip 和每个重定向。</td></tr>
+<tr><td>F17 / P2</td><td>所有 curl 调用</td><td>没有统一处理代理环境变量和 .curlrc，curl 可能走代理而 ping/mtr 直连，导致结果混合。新增 direct / proxy 两种明确模式；direct 用 curl 首参数 -q 及明确禁代理设置；proxy 记录代理类型并脱敏。源码中写“直连”并不能保证实际直连。</td></tr>
+<tr><td>F18 / P2</td><td>1139–1199<br>1340</td><td>HTTPS 主表的 TCP/TLS 在简单单次请求中做了阶段差值，TTFB 则是从请求开始累计，含重定向时阶段归因更复杂；TG 表直接把累计 time_connect/time_appconnect 标成 TCP/TLS。应明确累计/阶段两种口径并保留原始数据、重定向数量和最终 URL。单次网页总时长受响应大小和站点逻辑影响，不能用统一 3/8 秒阈值定位线路故障。</td></tr>
+<tr><td>F19 / P2</td><td>1150–1169<br>1189–1190</td><td>HTTP 状态处理不完整：500、502、504、404 等可能落入 OK，403/429/451/503 被混成 IP 风控提示。网络连通、TLS 验证、HTTP 应用状态、风控证据要分列；503 不足以证明封 IP。速度、DNS、TLS 多问题不应用 elif 互相掩盖。</td></tr>
+<tr><td>F20 / P2</td><td>954–985</td><td>MTU 只有一个目标与四档尺寸、每档两包，随机丢包也可能触发建议；只通过 payload 1200（IPv4 MTU 下界 1228）时仍推荐 1400，已复现。先确认小包基线，再多目标重复测、二分估计、记录明确的 fragmentation-needed 证据；结果是特定目标/地址族的路径 MTU 信息，不自动等同网卡应设值。</td></tr>
+<tr><td>F21 / P2</td><td>884–903<br>1454–1479<br>1519–1546</td><td>缺乏 LC_ALL=C；ping 权限/解析/命令错误都可能变成 100% 丢包；mdev 被统称 jitter；默认 8 包中丢 1 包就是 12.5%，不适合稳定判断 &gt;5%。TCP 五次里仅成功一次仍只显示成功采样均值，已复现。保留 attempted/succeeded/failed、退出码、原始样本，分别展示 RTT 标准差与明确定义的抖动；低样本结论标低置信度。</td></tr>
+<tr><td>F22 / P2</td><td>1482–1504<br>1552–1567<br>1681–1719</td><td>TCP curl telnet 建连后可能等到 4 秒上限才返回；DNS 域名在各工具中重复解析可能测到不同后端；mtr TCP 失败会静默降为默认 ICMP，表头仍标 TCP；TCP 探测发现 80 可用，TCP mtr 却固定 443。应固定目标 IP、实际端口、协议、源接口，使用直接建连测量并按真实回退结果标注。</td></tr>
+<tr><td>F23 / P2</td><td>1709–1725<br>1741<br>1798<br>1816</td><td>首跳高丢包、连续星号、18 跳等证据不足以断言网关坏、黑洞或绕路。即使终点对探测限速，也不必然等于业务流量丢失。通过端到端 TCP/HTTPS、多协议、多时段交叉验证，使用“观察 / 假设 / 下一步”三级描述。</td></tr>
+<tr><td>F24 / P2</td><td>1204–1231<br>1258–1283<br>1325–1328</td><td>HTTP 500 大于 1000 字节时可被计为成功测速，已复现；超时丢弃已下载字节；TG 下载完整安装包，只有时间上限没有字节预算；普通 HTTPS 同样可能下载大正文。增加有效状态/内容校验、单目标与全局流量预算、部分采样记录、重复测量及中位数；单连接下载不能代表线路最大带宽。</td></tr>
+<tr><td>F25 / P2</td><td>1235–1236<br>1365–1389</td><td>固定 DC IP 与城市标签会过时；官网/安装包 CDN、TCP 443 与 MTProto 媒体链路并非同一服务。不能宣称这些测试“足以排除 TG 宕机”。显示端点来源、更新时间和能力边界；如增加协议级测试，应单独设计，不要求用户提供聊天凭据。</td></tr>
+<tr><td>F26 / P2</td><td>1820–1831</td><td>名为 conntrack 的模块实际只看 ss 和 8000 条 established 阈值，没有检查 conntrack。应读取 nf_conntrack_count/max（不存在则不适用）、内核网络丢弃/错误计数、连接失败与重传增量；结合 CPU steal、软中断和接口统计。连接数多本身不能证明网卡或连接表满。</td></tr>
+<tr><td>F27 / P2</td><td>590–639<br>671–684</td><td>宣称默认不改系统，实际 root 缺依赖时会自动 apt 安装；ensure_deps 失败未阻止主流程。timedatectl 命令存在不代表 systemd 总线可用，靠英文展示文本判断易受 locale 影响，无工具却记 OK。默认检测应不安装，缺能力标 SKIP/UNKNOWN，安装改为显式选项；时间同步用机器可读属性并区分未同步与已证实时钟偏差。</td></tr>
+<tr><td>F28 / P2</td><td>2046–2050</td><td>gai.conf 单条 precedence 会取代默认 precedence 表；影响范围是使用相关 glibc 地址排序的程序，不能保证所有运行时/代理软件都改成优先 IPv4。应保留需要的默认策略及用户已有规则，并提示生效范围和进程缓存。详见下方 gai.conf 手册。</td></tr>
+<tr><td>F29 / P2</td><td>1118–1130<br>1178<br>1874–1917</td><td>没有统一 EXIT/INT/TERM 清理与子进程管理，取消后可能遗留临时文件/进程；mktemp 创建失败未显式处理；每五个任务整批 wait 会等待最慢者，不是持续补位并发。采用有界工作池、PID 记录、总 deadline；清理仅本次拥有的资源。</td></tr>
+<tr><td>F30 / P2</td><td>190–252<br>2294–2330<br>2352–2354</td><td>多个 --*-only 可同时接受，实际由 main 固定顺序决定，部分请求静默被忽略；CLI 修复选项仍先跑整套检测，菜单修复却跳过，行为不一致；总结早于 unlock/修复。先解析统一执行计划，冲突即明确拒绝，所有模块结束后再输出完整总结。</td></tr>
+<tr><td>F31 / P3</td><td>531–554<br>1110–1113<br>2257–2286</td><td>日志正文有多条输出路径，分隔线/部分表头不完整；printf %b 会解释数据里的反斜杠转义；URL 文件删除所有空格/井号后内容，可能改变合法输入。统一文本/JSON 渲染，外部数据按普通字符串输出并清理终端控制字符，URL 解析只处理约定的注释行和两端空白。</td></tr>
+<tr><td>F32 / P3</td><td>全局</td><td>缺少机器可读结果、端点版本、能力矩阵、配置文件、运行预算与自动化回归；一键进程替换运行后 $0 常为 /dev/fd/63，生成的“下次 bash $0”说明不可复用。发布固定版本文件、稳定启动示例、结构化报告和可测试入口。</td></tr>
+</table>
+<h2>5. 建议的下一版结构</h2>
+<p><strong>保留 Bash 作为运行入口，源码模块化，发布时可打包成单文件。</strong>这样保留 VPS 上易用的一键入口，又避免把解析、采集、归因、修复继续混在一个控制流中。是否引入 Python 应由目标系统兼容范围决定，不必一开始强制要求。JSON 可用 jq 构建，绝不能靠未转义字符串拼接。</p>
+<pre>CLI / 菜单
+    ↓ 同一套参数校验与执行计划
+环境与能力检测 → 统一上下文（地址族、resolver、proxy、接口、预算）
+    ↓
+采集器：DNS / ICMP / TCP / TLS / HTTP / PMTU / 路由 / 下载
+    ↓ 只产出证据，不写系统
+规则层：事实 → 推断 → 置信度 → 建议
+    ↓
+输出层：终端 / JSON / 脱敏报告 / 与历史结果比较
+
+独立修复层：计划 → 保存前态 → 应用 → 验证 → 提交或回滚</pre>
+<p>目录建议：<code>bin/</code> 入口，<code>lib/core/</code> 上下文与执行器，<code>lib/probes/</code> 采集器，<code>lib/rules/</code> 归因，<code>lib/repair/</code> 事务，<code>data/</code> 端点配置，<code>tests/fixtures/</code> 原始工具输出，<code>dist/</code> 发布文件。</p>
+<h3>统一结果协议</h3>
+<pre>{
+  "schema_version": "1.0",
+  "probe": "https",
+  "target": "https://example.com/",
+  "family": "ipv6",
+  "resolver": {"mode": "system"},
+  "proxy_mode": "direct",
+  "status": "WARN",
+  "transport": {"tcp": "ok", "tls": "ok", "curl_exit": 0},
+  "http_status": 403,
+  "observation": "TLS 成功，站点拒绝本次 HTTP 请求",
+  "diagnosis": null,
+  "confidence": "high",
+  "repair_recommendations": []
+}</pre>
+<p>示例中 high 仅指“观察到 403”这一事实，不是“被封 IP”的置信度。缺失数据用 null，不能冒充 0。实际还应记录 run_id、时间、耗时、原始输出引用、工具版本、local_ip/remote_ip、重定向、attempted/succeeded/failed 和采样口径。</p>
+<p>状态采用 PASS / WARN / FAIL / UNKNOWN / SKIP；UNKNOWN 表示证据不足，SKIP 表示未执行或条件不满足。区分“探测目标失败”和“工具执行失败”，避免把缺工具计为网络不通。</p>
+<h3>统一命令执行器</h3>
+<ul><li>每个任务保存 argv、开始/结束时间、退出码、stdout、stderr；设置连接超时、任务时限和全局时限。</li><li>控制并发，测速与高频时延测量尽量隔离，避免测量流量自己制造拥塞。</li><li>统一 locale；探测命令使用参数数组，URL 使用 scheme 白名单、禁 glob、参数分隔；避免 eval 和拼接 bash -c。</li><li>对 curl 功能作版本/能力检测。不能假设老系统支持所有 write-out 字段、HTTP/3 或某个 DNS backend；缺能力明确降级。</li><li>所有 DNS 与地址族选择显式生效；重定向逐跳记录，无法维持指定策略时明确失败/降级，不能静默切换。</li></ul>
+<h3>修复事务必须满足的条件</h3>
+<ol><li>独立的 <code>repair plan</code> 展示具体文件、接口、规则、影响范围及验证条件。</li><li>保存原始值、权限、所有者、链接及文件内容；状态放入受保护且唯一的运行目录。</li><li>串行加锁并校验变更前状态；只有明确选择的修复动作可以应用。</li><li>一次修改后立即检查真实生效状态；持久化与当前运行状态分别验证。</li><li>涉及 SSH 入口、IPv6、DNS、MTU 的变更提供延时自动回滚；不以单一公网站点恢复正常作为唯一提交条件。</li><li>显式 commit 后取消回滚；失败、掉线或未确认则恢复前态；撤销不得删除他人规则。</li></ol>
+<p>可提供 <code>repair apply --plan plan.json</code>、<code>repair rollback --run-id ...</code>；这些是建议的未来接口，当前原版并不支持。</p>
+<h2>6. 功能扩展：按用途分层</h2>
+<table><tr><th>层级</th><th>建议能力</th><th>边界</th></tr>
+<tr><td>第一层：基础可信度</td><td>IPv4/IPv6 对照；A/AAAA 与 NSS；TCP、TLS、HTTP 分层；真实目标路由；代理模式；JSON；总预算</td><td>优先落实，覆盖最常见且可证实的问题。</td></tr>
+<tr><td>第二层：链路诊断</td><td>指定端口/接口/源地址；多样本中位数与分位数；PMTU/tracepath；实际 conntrack 与内核计数增量；历史差异</td><td>单侧追踪只能描述观测到的前向路径，不能单凭它给回程线路下结论。</td></tr>
+<tr><td>第三层：业务专项</td><td>可维护的 Telegram 端点；流媒体适配器；TLS 版本/证书；可选 HTTP/2、HTTP/3、DoT、DoH</td><td>HTTP/3 需要工具实际支持；curl 不执行网页 JavaScript，不能等同浏览器业务验证。</td></tr>
+<tr><td>第四层：多视角观测</td><td>用户侧代理对比、受控远端探针、可选 iperf3 服务、不同时间窗口比较</td><td>端到端/回程/最大吞吐需要相应对端或测量视角；公网 IP 地理库不能证明线路等级。</td></tr></table>
+<p>建议默认检测不修改系统、不自动安装包、不自动跑第三方代码。下载测速和流媒体作为显式选项，并预先显示时长/流量预算。兼容性先做好 Debian/Ubuntu 与 systemd，其他发行版、Alpine、容器环境以能力矩阵逐步扩展。</p>
+<h2>7. 分阶段实施与验收</h2>
+<table><tr><th>阶段</th><th>范围</th><th>可验收结果</th></tr>
+<tr><td>A：可信基础修复</td><td>F01–F10；参数验证；默认不安装；保留原始错误；取消与清理</td><td>15 个复现用例转为正确行为断言；403 不触发 IPv6 修复；未达目标不报已到；修复失败不能显示成功；失败状态有明确退出码。</td></tr>
+<tr><td>B：采集与报告重构</td><td>统一 DNS/地址族/代理/接口；结构化结果；工具能力检测；真实 conntrack；流量与时间预算</td><td>同一目标各模块实际 IP、接口与协议一致；JSON 可被解析且缺测为 null；系统 DNS 回退可追踪；每项测量有 raw evidence。</td></tr>
+<tr><td>C：可回滚修复</td><td>配置管理器识别、快照、互斥动作、所有权标记、延时回滚、幂等</td><td>第二次应用无重复资源；撤销恢复原值且不动他人配置；写失败/服务失败/连接断开测试都可恢复。</td></tr>
+<tr><td>D：专项与发布</td><td>TG、流媒体、TLS/HTTP 扩展；端点版本；发布校验；文档</td><td>第三方链固定且记录版本；明确可用/受限/未知；慢源、失败源和取消均受预算约束；发布物来源可追溯。</td></tr></table>
+<p>建议先发布兼容旧参数的修正版本，再发布新架构版本；不要在同一轮同时改 CLI、所有检测算法、所有修复机制和发行版范围。</p>
+<h3>必备 Linux 测试矩阵</h3>
+<ul><li>网络：IPv4-only、IPv6-only、双栈、ICMP 禁用但 HTTPS 通、IPv6 无路由、IPv6 403、DNS 不通、NXDOMAIN、CNAME、多 A/AAAA、UDP 53 失败但 TCP 成功。</li><li>HTTP/TLS：证书过期/不匹配、代理存在、跨域重定向、自定义端口、429/500/503、超时但已有部分数据、大正文与慢流。</li><li>质量：末跳不是目标、全星号、ECMP、目标 ICMP 限速、仅 80 端口开放、mtr 不支持 TCP/JSON、单次成功多次失败。</li><li>系统：普通用户、root、缺 CAP_NET_RAW、容器无 systemd、只读 /etc、多默认路由、PPP、非英文 locale、缺工具。</li><li>修复：resolv.conf 普通文件与符号链接、预存 MSS 规则、原 MTU 非 1500、原 IPv6 已关闭、配置写入失败、服务重启失败、重复应用、SIGINT/SIGTERM、回滚期间外部改动。</li></ul>
+<p>单元测试用固定夹具；网络行为用 Linux network namespace/netem 与受控 DNS/HTTP 服务；系统修复在一次性虚拟机测试。当前 Windows/Git Bash 的 15 项隔离复现只覆盖逻辑回归，不代替以上验收。</p>
+<h2>8. 使用入口与审计注意事项</h2>
+<p>用户提供的 <code>bash &lt;(curl -fsSL ...)</code> 会执行下载到的内容；下载失败状态也不直接等同外层 bash 状态。开发审查建议采用“下载固定版本 → 校验 → bash -n → 显式执行”的入口。即使顶层脚本固定了版本，内部执行远程 main 的依赖仍需另行固定和审查。</p>
+<p>日志默认包含公网/内网 IP、主机名、路由、URL 等信息；分享报告应脱敏 URL 用户信息、query token、代理密码及内部地址。保留本机完整私有报告，另生成可分享副本。最终建议说明清楚“检测发生在哪个网络命名空间、是否经代理、哪个地址族、哪个目标、哪个时间窗口”。</p>
+<h2>9. 核验资料</h2>
+<ul><li><a href="https://github.com/M3DaLou/inonescripts/blob/306fb79025c791dd0e28118cedc82b46c2bad112/vps-netcheck.sh">本次审查的固定源码</a>：以上缺陷的主证据。</li>
+<li><a href="https://curl.se/docs/manpage.html">curl 官方手册</a>：时间字段、退出码、代理环境、配置与解析选项。在线文档对应较新版本，实施时须检测目标系统版本。</li>
+<li><a href="https://github.com/traviscross/mtr">mtr 官方项目</a>及<a href="https://github.com/traviscross/mtr/blob/master/man/mtr.8.in">手册</a>：逐跳探测、响应限速及输出能力。</li>
+<li><a href="https://man7.org/linux/man-pages/man5/gai.conf.5.html">Linux man-pages：gai.conf</a>：自定义 precedence 对默认表的影响及 glibc 适用范围。</li>
+<li><a href="https://core.telegram.org/api/datacenter">Telegram 官方 DC 文档</a>：入口 IP/port 可变化，普通 DC、媒体连接和 CDN 的区分。</li>
+<li><a href="https://github.com/lmc999/RegionRestrictionCheck/blob/main/check.sh">RegionRestrictionCheck 当前源码</a>：本次只抽查集成相关路径，未对该项目作完整安全评估。</li></ul>
+<p class="muted">本报告的重点是把“看起来像故障”转换为“有可核对证据的结论”，并确保每一个系统改动可验证、可追踪、可恢复。</p>
+</main></body></html>

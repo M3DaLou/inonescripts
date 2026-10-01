@@ -1,0 +1,30 @@
+# v2 验证记录
+
+日期：2026-10-01。版本：2.0.0-rc1。
+
+## 已验证
+
+- 51 项自动化测试通过：`python3 -m unittest discover -s tests -v`。
+- 其中 5 项使用真实 curl 访问本机受控 HTTP 服务，覆盖成功、403、500、重定向和未知 Content-Length 的正文限额。
+- 其余测试覆盖输入验证、目标路由识别、指定 DNS 不静默回退、错误保存、超时、TCP 失败采样、配置快照与回滚冲突等。
+- 修复命令使用 mock；测试文件位于临时目录，没有修改主机网络配置。
+- 单文件 Bash 语法与 `--help` 启动入口通过；Python 源码兼容性语法按 3.8 检查。
+- `build.py --check` 核对源码、单文件脚本和 SHA256SUMS 一致；构建在不同工作目录中产生相同结果。
+- Git 差异空白检查通过。
+
+执行环境为 Windows。Bash 启动验证使用 Git Bash 和已有 Python 运行时；这不等于 Linux 集成测试。
+
+## 尚未验收
+
+- Linux systemd-run 定时器、真实 iptables 和 SSH 断连后的回滚。
+- 真实 IPv4/IPv6、策略路由、不同权限/capability、不同发行版和网络管理器。
+- 跨重启的持久修复事务；当前实现不承诺该能力。
+
+因此保留 rc1 标识，先在测试 VPS 验证修复操作。
+
+## 原版审查基线
+
+- v1.5.0 来源 commit：`306fb79025c791dd0e28118cedc82b46c2bad112`。
+- 原版脚本 SHA-256：`ab3afb0e4d09b025ba11c3aff1876a12979bd921760f1e51729a5e03a5fb3a01`。
+- [15 项原版缺陷的复现记录](v1-reproductions.txt)。
+- [完整审查与改进路线](v1-audit.html)；路线并非全部在 rc1 实现。

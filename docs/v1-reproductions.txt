@@ -1,0 +1,18 @@
+REPRODUCED 01 Invalid IPv4 accepted
+REPRODUCED 02 Invalid IPv6 accepted
+REPRODUCED 03 PPP default interface parsed as link
+REPRODUCED 04 MTR router response counted as destination reached
+REPRODUCED 05 Traceroute header alone counts as reached
+REPRODUCED 06 IPv6 failure flag survives HTTPS success
+REPRODUCED 07 IPv6 HTTP 403 treated as broken networking
+REPRODUCED 08 curl certificate error and timings discarded
+REPRODUCED 09 HTTP 500 page accepted as valid speed sample
+REPRODUCED 10 Automatic fix applies both IPv4 preference and IPv6 disable
+REPRODUCED 11 MTU recommendation exceeds largest passing size
+REPRODUCED 12 One successful TCP sample hides four failed attempts
+REPRODUCED 13 Missing curl and FAIL still produce exit status zero
+REPRODUCED 14 CLI unlock region bypasses validation
+REPRODUCED 15 Custom DNS failure silently falls back to system resolution
+
+Reproduced: 15/15
+./definitions.sh: line 540: printf: missing unicode digit for \U
