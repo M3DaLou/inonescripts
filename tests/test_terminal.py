@@ -64,10 +64,43 @@ class PipeTerminal(unittest.TestCase):
 
     def test_target_menu_second_prompt(self):
         args = n.parser().parse_args([])
-        with self.terminal(b"4\nexample.com,1.1.1.1\n"):
+        with self.terminal(b"4\nexample.com,1.1.1.1\n30\n8443\n4\n"):
             n.interactive_options(args)
         self.assertEqual(args.quality_only, "example.com,1.1.1.1")
+        self.assertEqual(args.count, 30)
+        self.assertEqual(args.port, 8443)
         self.assertIn("目标 IP", self.prompt)
+
+    def test_menu_ipv6_target_defaults_to_ipv6(self):
+        args = n.parser().parse_args([])
+        with self.terminal(b"4\n2001:db8::1\n\n\n\n"):
+            n.interactive_options(args)
+        self.assertEqual(args.family, "6")
+
+    def test_menu_can_quit_without_scanning(self):
+        with self.terminal(b"q\n"):
+            self.assertFalse(n.interactive_options(n.parser().parse_args([])))
+        self.assertIn("未开始检测", self.prompt)
+
+    def test_menu_reprompts_invalid_input(self):
+        args = n.parser().parse_args([])
+        with self.terminal(b"invalid\n1\n"):
+            self.assertTrue(n.interactive_options(args))
+        self.assertTrue(args.quick)
+        self.assertIn("重新输入", self.prompt)
+
+    def test_menu_website_accepts_bare_domain(self):
+        args = n.parser().parse_args([])
+        with self.terminal(b"6\nexample.com\n"):
+            n.interactive_options(args)
+        self.assertEqual(args.url, ["https://example.com"])
+
+    def test_menu_double_stack(self):
+        args = n.parser().parse_args([])
+        with self.terminal(b"8\n"):
+            n.interactive_options(args)
+        self.assertEqual(args.family, "0")
+        self.assertTrue(args.full)
 
     def test_eof_does_not_start_default_scan(self):
         with self.terminal(b""), self.assertRaises(OSError):

@@ -20,8 +20,9 @@ import threading
 import time
 from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
+from netcheck_report import render_report, progress_line
 
-VERSION = "2.0.0-rc1"
+VERSION = "2.0.0-rc2"
 DEFAULT_URLS = ["https://www.cloudflare.com/", "https://www.google.com/",
                 "https://github.com/", "https://www.microsoft.com/", "https://www.baidu.com/"]
 TG_ENDPOINTS = ["149.154.175.50", "149.154.167.51", "149.154.175.100",
@@ -257,8 +258,7 @@ class Checker:
     def add(self, row):
         with self.lock:
             self.rows.append(row)
-            print("[{status}] {probe} {target}: {observation}".format(**{
-                k: safe_text(v) for k, v in row.items()}), flush=True)
+            print(progress_line(row), flush=True)
         return row
 
     def resolve(self, host, family):
@@ -587,9 +587,12 @@ class Checker:
                   "results": self.rows, "cancelled": STOP.is_set(), "deadline_exceeded": time.monotonic() >= self.deadline}
         target = self.run_dir / "report.json"
         target.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
-        text = "\n".join("[{status}] {probe} {target}: {observation}".format(**r) for r in self.rows)
-        (self.run_dir / "report.txt").write_text(text + "\n", encoding="utf-8")
-        print("报告：" + str(target))
+        text = render_report(report)
+        text_path = self.run_dir / "report.txt"
+        text_path.write_text(text, encoding="utf-8")
+        print(text, end="", flush=True)
+        print("文本报告：" + str(text_path))
+        print("JSON 报告：" + str(target))
         if STOP.is_set():
             return 130
         if any(r["status"] == "FAIL" for r in self.rows):
@@ -652,21 +655,87 @@ def interactive_options(args):
     # separate reader/writer streams also work when stdin carries our heredoc.
     with open("/dev/tty", "r", encoding="utf-8") as reader, \
             open("/dev/tty", "w", encoding="utf-8", buffering=1) as writer:
-        writer.write("1 快速体检 / 2 完整体检 / 3 Telegram / 4 指定目标\n选择 [1]: ")
-        writer.flush()
-        line = reader.readline()
-        if not line:
-            raise OSError("终端输入已关闭，未开始检测")
-        choice = line.strip() or "1"
+        def ask(label, default=None, validate=None):
+            while True:
+                writer.write(label + (" [%s]" % default if default is not None else "") + ": ")
+                writer.flush()
+                line = reader.readline()
+                if not line: raise OSError("终端输入已关闭，未开始检测")
+                value = line.strip() or (str(default) if default is not None else "")
+                try:
+                    return validate(value) if validate else value
+                except (ValueError, argparse.ArgumentTypeError) as exc:
+                    writer.write("  " + str(exc) + "，请重新输入。\n")
+
+        def integer(low, high):
+            def validate(value):
+                try: value = int(value)
+                except ValueError: raise ValueError("请输入整数")
+                if not low <= value <= high: raise ValueError("范围为 %s–%s" % (low, high))
+                return value
+            return validate
+
+        def targets(value):
+            return ",".join(valid_target(x.strip()) for x in value.split(","))
+
+        def resolvers(value):
+            return ",".join(valid_ip(x.strip()) for x in value.split(","))
+
+        def menu_choice(value):
+            if value.lower() not in ("1", "2", "3", "4", "5", "6", "7", "8", "h", "q", "0"):
+                raise ValueError("请选择 1–8、h 或 q")
+            return value.lower()
+
+        while True:
+            writer.write("\n" + "=" * 52 + "\nVPS 网络体检 v%s\n" % VERSION +
+                         "检测完成后自动在终端展示详细报告，并保存文本/JSON。\n" +
+                         "  1) 快速体检        DNS、网站、延迟和连通性\n" +
+                         "  2) 完整体检        增加路由追踪和路径 MTU\n" +
+                         "  3) Telegram       官网与入口 TCP 连通性\n" +
+                         "  4) 指定目标质量   自选 IP/域名、次数和端口\n" +
+                         "  5) 体检＋下载测速 会产生额外下载流量\n" +
+                         "  6) 加测指定网站   输入网址，查看具体耗时\n" +
+                         "  7) 使用指定 DNS   只影响本轮，不改系统\n" +
+                         "  8) IPv4＋IPv6     双栈完整体检\n" +
+                         "  h) 全部参数说明\n  q) 退出\n" + "=" * 52 + "\n")
+            choice = ask("选择", "1", menu_choice)
+            if choice in ("q", "0"):
+                writer.write("已退出，未开始检测。\n")
+                return False
+            if choice == "h":
+                writer.write(parser().format_help())
+                continue
+            break
+        args.quality_only, args.telegram_only, args.unlock_only = None, False, False
         if choice == "1": args.quick, args.full = True, False
         elif choice == "2": args.quick, args.full = False, True
         elif choice == "3": args.telegram_only = True
         elif choice == "4":
-            writer.write("目标 IP/域名（逗号分隔）: "); writer.flush()
-            args.quality_only = reader.readline().strip()
-            if not args.quality_only: raise ValueError("未指定目标")
-        else:
-            raise ValueError("无效菜单选项")
+            args.quality_only = ask("目标 IP/域名（逗号分隔）", validate=targets)
+            args.count = ask("采样次数", args.count if args.count != 5 else 20, integer(1, 100))
+            args.port = ask("TCP 端口", args.port, integer(1, 65535))
+            versions = set()
+            for target in args.quality_only.split(","):
+                try: versions.add(ipaddress.ip_address(target).version)
+                except ValueError: pass
+            default_family = "0" if versions == {4, 6} else "6" if versions == {6} else args.family
+            def family(value):
+                if value not in ("4", "6", "0"): raise ValueError("填写 4、6 或 0（双栈）")
+                return value
+            args.family = ask("地址族：4=IPv4，6=IPv6，0=双栈", default_family, family)
+            args.deadline = max(args.deadline, min(3600, len(args.quality_only.split(",")) * (args.count * 2 + 40)))
+        elif choice == "5":
+            args.speed = True
+            writer.write("测速单个地址族最多请求 %.1f MB；全局正文预算 %.1f MB。\n" % (args.speed_mb, args.max_download_mb))
+        elif choice == "6":
+            args.url.append(ask("网站 URL", validate=lambda s: valid_url(s if "://" in s else "https://" + s)))
+        elif choice == "7":
+            args.dns = [ask("DNS IP（逗号分隔）", "1.1.1.1,8.8.8.8", resolvers)]
+        elif choice == "8":
+            args.family, args.quick, args.full = "0", False, True
+        writer.write("\n开始检测：%s，总时限 %s 秒。\n" % ({"4": "IPv4", "6": "IPv6", "0": "IPv4＋IPv6"}[args.family], args.deadline))
+        writer.flush()
+        return True
 
 
 def main(argv=None):
@@ -675,7 +744,8 @@ def main(argv=None):
     args = p.parse_args(argv)
     if args.interactive:
         try:
-            interactive_options(args)
+            if interactive_options(args) is False:
+                return 0
         except OSError as exc:
             p.error("无法访问交互终端：%s；无终端环境请指定 --quick 等 CLI 参数" % exc)
         except ValueError as exc:

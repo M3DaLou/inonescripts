@@ -7,8 +7,9 @@ from pathlib import Path
 root = Path(__file__).resolve().parent
 core = (root / "src/netcheck.py").read_text(encoding="utf-8")
 repair = (root / "src/netcheck_repair.py").read_text(encoding="utf-8")
+report = (root / "src/netcheck_report.py").read_text(encoding="utf-8")
 header = '''#!/usr/bin/env bash
-# VPS Netcheck 2.0.0-rc1. Sources and tests are in the accompanying release.
+# VPS Netcheck 2.0.0-rc2. Sources and tests are in the accompanying release.
 # Requires Python 3.8+. This launcher does not install dependencies.
 set -u
 command -v python3 >/dev/null 2>&1 || { echo '需要 Python 3.8+；请先安装 python3。' >&2; exit 2; }
@@ -22,7 +23,10 @@ _repair = types.ModuleType('netcheck_repair')
 # repr is Python source quoting, not shell interpolation. The here-doc is quoted.
 payload = header + "_repair.REPAIR_SOURCE = " + repr(repair) + "\n"
 payload += "exec(compile(_repair.REPAIR_SOURCE, '<netcheck_repair>', 'exec'), _repair.__dict__)\n"
-payload += "sys.modules['netcheck_repair'] = _repair\n\n" + core + "\nVPS_NETCHECK_PYTHON_EOF\n"
+payload += "sys.modules['netcheck_repair'] = _repair\n\n"
+payload += "_report = types.ModuleType('netcheck_report')\n"
+payload += "exec(compile(" + repr(report) + ", '<netcheck_report>', 'exec'), _report.__dict__)\n"
+payload += "sys.modules['netcheck_report'] = _report\n\n" + core + "\nVPS_NETCHECK_PYTHON_EOF\n"
 target = root / "vps-netcheck-v2.sh"
 script_bytes = payload.encode("utf-8")
 checksum_bytes = (hashlib.sha256(script_bytes).hexdigest() + "  " + target.name + "\n").encode("ascii")

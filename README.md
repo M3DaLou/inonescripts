@@ -6,10 +6,10 @@
 
 | 版本 | 入口 | 状态 |
 | --- | --- | --- |
-| v2.0.0-rc1 | [`vps-netcheck-v2.sh`](vps-netcheck-v2.sh) | 重构候选版，Python 3.8+，默认只读、不自动安装 |
+| v2.0.0-rc2 | [`vps-netcheck-v2.sh`](vps-netcheck-v2.sh) | 重构候选版，Python 3.8+，终端自动展示详细报告 |
 | v1.5.0 | [`vps-netcheck.sh`](vps-netcheck.sh) | 历史 Bash 版本，原入口保留；存在已记录的误判和修复风险 |
 
-**v2 已在 Linux 容器中通过 67 项自动化测试，包含真实终端和单文件菜单；仍需 systemd、iptables、真实双栈和 SSH 回滚实机验收。**
+**v2 已在 Linux 容器中通过 83 项自动化测试，包含真实终端、单文件菜单和终端报告；仍需 systemd、iptables、真实双栈和 SSH 回滚实机验收。**
 详细范围见[验证记录](docs/verification.md)。
 
 ## 使用 v2
@@ -23,6 +23,14 @@ bash <(curl -fsSL https://raw.githubusercontent.com/M3DaLou/inonescripts/codex/v
 普通用户缺依赖时会通过 sudo 安装；已是 root 则直接安装。需要已存在 curl 来获取启动入口。
 自动安装是 `v2.sh` 的行为，直接运行 `vps-netcheck-v2.sh` 仍不会自动安装。
 无交互终端时使用默认检测；也可在同一行最后加 `--quick`、`--full`、`--telegram-only` 等参数。
+
+### 直接在终端看结果
+
+检测结束后自动展开完整报告：异常汇总、本机网卡/路由、公网 IP、DNS 答案、HTTP 状态与 TCP/TLS/TTFB 耗时、ICMP 丢包与延迟、TCP 成功/失败采样、MTR 每跳结果、测速等。只展示本轮执行的项目，不需要另外打开 JSON。
+
+`report.txt` 保存同一份详细报告；`report.json` 继续保存原始结构化证据。报告末尾同时打印两种文件的路径。
+
+交互菜单提供快速/完整体检、Telegram、指定目标、测速、指定网站、指定 DNS 和双栈检测。指定目标时可输入次数、端口与地址族；输错可重试，`q` 退出。
 
 从仓库取得脚本后，在 Linux 上执行：
 
@@ -74,6 +82,7 @@ MTU/MSS 目前只修改运行时状态；托管的 resolv.conf 会拒绝直接�
 ```text
 src/netcheck.py          v2 检测和 CLI
 src/netcheck_repair.py   显式修复、前态保存、提交与回滚
+src/netcheck_report.py   终端与文本文件共用的详细报告
 tests/                  自动化测试与 v1 缺陷复现
 build.py                生成单文件 Bash 及 SHA256SUMS
 v2.sh                   自动准备依赖的一行启动入口

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# VPS Netcheck 2.0.0-rc1. Sources and tests are in the accompanying release.
+# VPS Netcheck 2.0.0-rc2. Sources and tests are in the accompanying release.
 # Requires Python 3.8+. This launcher does not install dependencies.
 set -u
 command -v python3 >/dev/null 2>&1 || { echo '需要 Python 3.8+；请先安装 python3。' >&2; exit 2; }
@@ -12,6 +12,10 @@ _repair = types.ModuleType('netcheck_repair')
 _repair.REPAIR_SOURCE = '"""Explicit reversible repairs. All persistent actions are guarded by a systemd timer."""\nimport argparse\nimport base64\nimport contextlib\nimport hashlib\nimport ipaddress\nimport json\nimport os\nimport re\nimport shutil\nimport subprocess\nimport sys\nimport time\nfrom pathlib import Path\n\nSTATE_ROOT = Path("/var/lib/vps-netcheck")\n\n\ndef command(argv, check=True):\n    r = subprocess.run(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,\n                       encoding="utf-8", errors="replace", timeout=20, env=dict(os.environ, LC_ALL="C"))\n    if check and r.returncode:\n        raise RuntimeError("%s: %s" % (argv[0], r.stderr.strip()))\n    return r\n\n\ndef atomic_write(path, data, mode=0o600):\n    temp = path.with_name(path.name + ".new-" + os.urandom(4).hex())\n    fd = os.open(str(temp), os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)\n    try:\n        with os.fdopen(fd, "wb") as f:\n            f.write(data); f.flush(); os.fsync(f.fileno())\n        os.replace(temp, path)\n    finally:\n        if temp.exists(): temp.unlink()\n\n\ndef snapshot_file(path):\n    p = Path(path)\n    if p.is_symlink():\n        raise RuntimeError("拒绝直接修改符号链接：%s；请通过系统网络管理器配置" % path)\n    if not p.exists():\n        return {"path": path, "exists": False, "data": None}\n    st = p.stat()\n    if not p.is_file(): raise RuntimeError("目标不是普通文件")\n    return {"path": path, "exists": True, "data": base64.b64encode(p.read_bytes()).decode(),\n            "mode": st.st_mode & 0o7777, "uid": st.st_uid, "gid": st.st_gid}\n\n\ndef restore_file(item):\n    p = Path(item["path"])\n    if p.is_symlink(): raise RuntimeError("回滚时文件变成符号链接，拒绝覆盖：" + str(p))\n    if item["exists"]:\n        atomic_write(p, base64.b64decode(item["data"]), item["mode"])\n        os.chown(p, item["uid"], item["gid"])\n    elif p.exists():\n        p.unlink()\n\n\ndef choose_iface(explicit):\n    if explicit:\n        if not Path("/sys/class/net", explicit).exists(): raise RuntimeError("网卡不存在")\n        return explicit\n    r = command(["ip", "-j", "route", "get", "1.1.1.1"])\n    rows = json.loads(r.stdout)\n    if not rows or not rows[0].get("dev"): raise RuntimeError("无法确定接口，请指定 --interface")\n    return rows[0]["dev"]\n\n\ndef build_plan(args):\n    action = args.repair\n    plan = {"action": action, "files": [], "operations": [], "scope": "", "rollback_seconds": args.rollback_after}\n    if action == "mtu":\n        if not args.value or not re.fullmatch(r"[0-9]{3,5}", args.value):\n            raise RuntimeError("MTU 必须显式指定 --value")\n        mtu = int(args.value)\n        if not 1280 <= mtu <= 9000: raise RuntimeError("本版 MTU 安全范围为 1280..9000")\n        iface = choose_iface(args.interface)\n        old = int(Path("/sys/class/net", iface, "mtu").read_text())\n        plan.update(interface=iface, before_mtu=old, after_mtu=mtu,\n                    scope="仅当前接口运行时 MTU；不写开机服务，不覆盖网络管理器配置")\n        plan["operations"] = [["ip", "link", "set", "dev", iface, "mtu", str(mtu)]]\n    elif action == "dns":\n        if not args.value: raise RuntimeError("DNS 必须显式指定 --value IP[,IP]")\n        ips = [str(ipaddress.ip_address(x.strip())) for x in args.value.split(",")]\n        if not 1 <= len(ips) <= 3: raise RuntimeError("DNS 数量需为 1..3")\n        snap = snapshot_file("/etc/resolv.conf")\n        old = base64.b64decode(snap["data"]).decode("utf-8", "replace") if snap["data"] else ""\n        if re.search(r"generated|managed|resolvconf|NetworkManager|systemd", old, re.I):\n            raise RuntimeError("resolv.conf 标注为自动管理，本版不覆盖；请通过对应网络管理器配置")\n        # A plain resolv.conf can still be managed. Reject active managers as well.\n        for unit in ("NetworkManager", "systemd-resolved", "systemd-networkd"):\n            if command(["systemctl", "is-active", "--quiet", unit], check=False).returncode == 0:\n                raise RuntimeError("检测到活动网络管理器 %s，本版不直接改 DNS" % unit)\n        retained = [line for line in old.splitlines() if not re.match(r"\\s*nameserver\\s", line)]\n        new = "\\n".join(retained + ["nameserver " + x for x in ips]) + "\\n"\n        plan["files"] = [dict(snap, after=base64.b64encode(new.encode()).decode())]\n        plan.update(dns=ips, scope="静态 /etc/resolv.conf；保留 search/options 等其他配置")\n    elif action == "ipv4-prefer":\n        snap = snapshot_file("/etc/gai.conf")\n        old = base64.b64decode(snap["data"]).decode("utf-8") if snap["data"] else ""\n        if re.search(r"^\\s*(precedence|label)\\s", old, re.M):\n            raise RuntimeError("已有自定义 gai 策略，拒绝覆盖；请手工合并")\n        addition = "\\n# vps-netcheck managed policy\\nprecedence ::1/128 50\\nprecedence ::/0 40\\nprecedence 2002::/16 30\\nprecedence ::/96 20\\nprecedence ::ffff:0:0/96 100\\n"\n        plan["files"] = [dict(snap, after=base64.b64encode((old + addition).encode()).decode())]\n        plan["scope"] = "glibc getaddrinfo 地址排序；不保证其他 DNS 实现及已有进程缓存立即变化"\n    elif action == "mss":\n        if not shutil.which("iptables"): raise RuntimeError("缺少 iptables；不会自动安装")\n        plan["scope"] = "IPv4 OUTPUT/FORWARD 的运行时规则；每条使用事务专属 comment，不持久化"\n    elif action in ("ntp", "flush-dns"):\n        plan["scope"] = "启用已有 NTP 服务" if action == "ntp" else "刷新 systemd-resolved 缓存（无可恢复前态）"\n        if action == "ntp":\n            old = command(["timedatectl", "show", "-p", "NTP", "--value"]).stdout.strip()\n            if old not in ("yes", "no"): raise RuntimeError("无法读取 NTP 原状态")\n            plan["before_ntp"] = old\n            plan["operations"] = [["timedatectl", "set-ntp", "true"]]\n        else:\n            if not shutil.which("resolvectl"): raise RuntimeError("未发现 resolvectl，不推断有无其他缓存")\n            plan["operations"] = [["resolvectl", "flush-caches"]]\n    return plan\n\n\ndef verify_plan(plan):\n    for item in plan["files"]:\n        p = Path(item["path"])\n        if p.is_symlink() or not p.exists() or p.read_bytes() != base64.b64decode(item["after"]):\n            raise RuntimeError("文件验证失败：" + item["path"])\n    if plan["action"] == "mtu":\n        if int(Path("/sys/class/net", plan["interface"], "mtu").read_text()) != plan["after_mtu"]:\n            raise RuntimeError("MTU 未生效")\n    elif plan["action"] == "ntp":\n        if command(["timedatectl", "show", "-p", "NTP", "--value"]).stdout.strip() != "yes":\n            raise RuntimeError("NTP 未启用；启用也不等于已经同步")\n    elif plan["action"] == "mss":\n        for rule in plan["rules"]:\n            command(["iptables", "-w", "5", "-t", "mangle", "-C"] + rule)\n\n\ndef save_tx(directory, tx):\n    atomic_write(directory / "transaction.json", json.dumps(tx, indent=2).encode())\n\n\n@contextlib.contextmanager\ndef state_lock(blocking=False):\n    import fcntl\n    if STATE_ROOT.is_symlink(): raise RuntimeError("状态目录不能是符号链接")\n    STATE_ROOT.mkdir(mode=0o700, parents=True, exist_ok=True)\n    st = STATE_ROOT.stat()\n    if st.st_uid != 0 or st.st_mode & 0o077: raise RuntimeError("状态目录必须 root 所有且权限 0700")\n    fd = os.open(str(STATE_ROOT / "lock"), os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)\n    try:\n        fcntl.flock(fd, fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB))\n        yield\n    finally:\n        os.close(fd)\n\n\ndef load_tx(run_id):\n    if not re.fullmatch(r"[0-9]{14}-[0-9a-f]{12}", run_id): raise RuntimeError("无效事务 ID")\n    directory = STATE_ROOT / run_id\n    if directory.is_symlink(): raise RuntimeError("事务路径不能是链接")\n    return directory, json.loads((directory / "transaction.json").read_text())\n\n\ndef rollback_tx(directory, tx, automatic=False):\n    if tx["state"] in ("rolled_back", "committed") and automatic: return\n    if tx["state"] == "rolled_back": return\n    if tx["state"] == "committed": raise RuntimeError("已提交事务不可直接撤销；请先重新规划以防覆盖之后的变更")\n    plan, errors = tx["plan"], []\n    for item in plan["files"]:\n        try:\n            p = Path(item["path"])\n            before = base64.b64decode(item["data"]) if item["data"] else None\n            actual = p.read_bytes() if p.exists() and not p.is_symlink() else None\n            if actual == before and not p.is_symlink(): continue\n            if actual != base64.b64decode(item["after"]) or p.is_symlink():\n                raise RuntimeError("文件有外部变更，拒绝覆盖：" + item["path"])\n            restore_file(item)\n        except Exception as exc:\n            errors.append(str(exc))\n    try:\n        if plan["action"] == "mtu":\n            current = int(Path("/sys/class/net", plan["interface"], "mtu").read_text())\n            if current not in (plan["before_mtu"], plan["after_mtu"]): raise RuntimeError("MTU 有外部变更，拒绝覆盖")\n            command(["ip", "link", "set", "dev", plan["interface"], "mtu", str(plan["before_mtu"])])\n        elif plan["action"] == "ntp":\n            command(["timedatectl", "set-ntp", "true" if plan["before_ntp"] == "yes" else "false"])\n        elif plan["action"] == "mss":\n            for rule in plan.get("rules", []):\n                if command(["iptables", "-w", "5", "-t", "mangle", "-C"] + rule, check=False).returncode == 0:\n                    command(["iptables", "-w", "5", "-t", "mangle", "-D"] + rule)\n    except Exception as exc:\n        errors.append(str(exc))\n    tx["state"] = "rollback_failed" if errors else "rolled_back"\n    tx["errors"] = errors\n    save_tx(directory, tx)\n    if errors: raise RuntimeError("回滚未完成：" + "; ".join(errors))\n\n\ndef apply_plan(plan, args):\n    if plan["action"] == "flush-dns":\n        command(plan["operations"][0]); print("缓存刷新命令成功；无持久配置变更")\n        return 0\n    if not Path("/run/systemd/system").is_dir() or not shutil.which("systemd-run"):\n        raise RuntimeError("此环境无法创建可靠的独立回滚计时器，拒绝应用；仍可查看修复计划")\n    for d in STATE_ROOT.iterdir():\n        f = d / "transaction.json"\n        if d.is_dir() and f.exists():\n            if json.loads(f.read_text()).get("state") in ("prepared", "pending", "rollback_failed"):\n                raise RuntimeError("存在未完成事务，请先提交或回滚：" + d.name)\n    run_id = time.strftime("%Y%m%d%H%M%S") + "-" + os.urandom(6).hex()\n    directory = STATE_ROOT / run_id\n    directory.mkdir(mode=0o700)\n    if plan["action"] == "mss":\n        plan["rules"] = [[chain, "-p", "tcp", "--tcp-flags", "SYN,RST", "SYN", "-m", "comment",\n                          "--comment", "vps-netcheck:" + run_id, "-j", "TCPMSS", "--clamp-mss-to-pmtu"]\n                         for chain in ("OUTPUT", "FORWARD")]\n    tx = {"id": run_id, "state": "prepared", "plan": plan}\n    save_tx(directory, tx)\n    # Store a standalone rollback runner so disconnecting the invoking shell cannot cancel it.\n    runner = directory / "rollback.py"\n    source = REPAIR_SOURCE if "REPAIR_SOURCE" in globals() else Path(__file__).read_text(encoding="utf-8")\n    atomic_write(runner, (source + "\\nif __name__ == \'__main__\':\\n    with state_lock(blocking=True):\\n        d,t=load_tx(sys.argv[1]); rollback_tx(d,t,automatic=True)\\n").encode())\n    unit = "vps-netcheck-" + run_id\n    try:\n        command(["systemd-run", "--quiet", "--unit", unit, "--on-active=%ds" % args.rollback_after,\n                 "--timer-property=AccuracySec=1s", sys.executable, str(runner), run_id])\n        for item in plan["files"]:\n            current = snapshot_file(item["path"])\n            if current["data"] != item["data"] or current["exists"] != item["exists"]:\n                raise RuntimeError("规划后文件状态改变，拒绝覆盖")\n            atomic_write(Path(item["path"]), base64.b64decode(item["after"]), item.get("mode", 0o644))\n            if item["exists"]: os.chown(item["path"], item["uid"], item["gid"])\n        for argv in plan["operations"]: command(argv)\n        for rule in plan.get("rules", []): command(["iptables", "-w", "5", "-t", "mangle", "-A"] + rule)\n        verify_plan(plan)\n        tx["state"] = "pending"\n        save_tx(directory, tx)\n    except Exception:\n        rollback_tx(directory, tx)\n        raise\n    print("已应用并通过本地状态验证；%d 秒后自动回滚。" % args.rollback_after)\n    print("验证 SSH/业务后提交：bash vps-netcheck-v2.sh --commit " + run_id)\n    print("立即回滚：bash vps-netcheck-v2.sh --rollback " + run_id)\n    return 0\n\n\ndef confirm_repair():\n    # Do not open a terminal with buffered r+: it requires seek support.\n    with open("/dev/tty", "r", encoding="utf-8") as reader, \\\n            open("/dev/tty", "w", encoding="utf-8", buffering=1) as writer:\n        writer.write("按以上计划应用？[y/N] "); writer.flush()\n        return reader.readline().strip().lower() == "y"\n\n\ndef repair_main(args):\n    try:\n        if args.commit or args.rollback or args.apply:\n            if not hasattr(os, "geteuid") or os.geteuid() != 0: raise RuntimeError("应用/提交/回滚需要 Linux root")\n        if args.commit or args.rollback:\n            with state_lock():\n                d, tx = load_tx(args.commit or args.rollback)\n                if args.commit:\n                    if tx["state"] != "pending": raise RuntimeError("仅能提交 pending 事务")\n                    verify_plan(tx["plan"])\n                    # Commit marker first: a timer racing with stop will see committed under the lock.\n                    tx["state"] = "committed"; save_tx(d, tx)\n                    command(["systemctl", "stop", "vps-netcheck-" + tx["id"] + ".timer"], check=False)\n                    print("事务已提交；MTU/MSS 仍仅当前运行时生效")\n                else:\n                    rollback_tx(d, tx)\n                    command(["systemctl", "stop", "vps-netcheck-" + tx["id"] + ".timer"], check=False)\n                    print("事务已回滚")\n            return 0\n        if not 30 <= args.rollback_after <= 900: raise RuntimeError("回滚时限需为 30..900 秒")\n        plan = build_plan(args)\n        print(json.dumps(plan, ensure_ascii=False, indent=2))\n        if not args.apply: print("仅显示计划；未修改系统。应用需显式加 --apply。"); return 0\n        if not args.yes:\n            if not confirm_repair(): print("已取消"); return 0\n        with state_lock():\n            # Rebuild under lock to capture the actual pre-apply state.\n            current = build_plan(args)\n            if current != plan: raise RuntimeError("确认期间系统状态改变，请重新规划")\n            return apply_plan(plan, args)\n    except (OSError, ValueError, RuntimeError, subprocess.TimeoutExpired) as exc:\n        print("修复未成功：" + str(exc), file=sys.stderr)\n        return 4\n'
 exec(compile(_repair.REPAIR_SOURCE, '<netcheck_repair>', 'exec'), _repair.__dict__)
 sys.modules['netcheck_repair'] = _repair
+
+_report = types.ModuleType('netcheck_report')
+exec(compile('"""Human-readable reports shared by the terminal and report.txt."""\nimport json\nimport math\nimport re\n\n\nSTATUS = {"PASS": "通过", "WARN": "注意", "FAIL": "失败", "UNKNOWN": "未确定", "SKIP": "已跳过"}\nPROBES = {"interfaces": "网卡", "sockets": "连接统计", "clock": "系统时间", "conntrack": "连接跟踪表",\n          "identity": "公网身份", "dns": "DNS", "http": "HTTP/HTTPS", "route": "内核路由",\n          "ping": "ICMP", "tcp": "TCP", "mtr": "路由追踪", "pmtu": "路径 MTU",\n          "quality": "目标质量", "speed": "下载测速", "telegram_web": "Telegram 官网",\n          "telegram_endpoint": "Telegram 入口", "unlock": "流媒体", "internal": "运行错误"}\nGROUPS = [("本机状态", {"interfaces", "sockets", "clock", "conntrack"}),\n          ("公网身份与 DNS", {"identity", "dns"}), ("网站连通与耗时", {"http"}),\n          ("目标网络质量与路由", {"quality", "route", "ping", "tcp", "mtr", "pmtu"}),\n          ("下载测速", {"speed"}), ("Telegram", {"telegram_web", "telegram_endpoint"}),\n          ("流媒体", {"unlock"})]\n\n\ndef clean(value):\n    text = re.sub(r"\\x1b\\][^\\x07]*(?:\\x07|\\x1b\\\\)", "", str(value))\n    text = re.sub(r"\\x1b\\[[0-?]*[ -/]*[@-~]", "", text)\n    return re.sub(r"[\\x00-\\x1f\\x7f-\\x9f]", "", text)\n\n\ndef number(value, unit="", digits=2):\n    if isinstance(value, bool): return "--"\n    try:\n        val = float(value)\n        if not math.isfinite(val) or val < 0: return "--"\n    except (TypeError, ValueError):\n        return "--"\n    return ("%.*f" % (digits, val)).rstrip("0").rstrip(".") + unit if digits else str(int(val)) + unit\n\n\ndef milliseconds(value):\n    try: return number(float(value) * 1000, " ms")\n    except (TypeError, ValueError): return "--"\n\n\ndef phase(metrics, end, start):\n    try:\n        a, b = float(metrics[end]), float(metrics[start])\n        if a <= 0 or a < b: return "--"\n        return milliseconds(a - b)\n    except (KeyError, TypeError, ValueError):\n        return "--"\n\n\ndef heading(row):\n    state = row.get("status", "UNKNOWN")\n    fam = " IPv%s" % row["family"] if row.get("family") else ""\n    if row.get("family_scope") == "proxy_connection": fam += "（代理连接）"\n    return "[%s] %s%s  %s" % (STATUS.get(state, clean(state)),\n                              PROBES.get(row.get("probe"), clean(row.get("probe", ""))), fam,\n                              clean(row.get("target", "")))\n\n\ndef progress_line(row):\n    return heading(row) + "：" + clean(row.get("observation", ""))\n\n\ndef raw_lines(value, prefix="    "):\n    return [prefix + clean(line) for line in str(value).splitlines() if clean(line).strip()]\n\n\ndef dns_lines(dns):\n    lines = []\n    if dns.get("addresses"):\n        addresses = [clean(x) for x in dns["addresses"] if x is not None]\n        if addresses: lines.append("    解析地址：" + ", ".join(addresses))\n    source = dns.get("source")\n    labels = {"literal": "IP 字面量", "system_nss": "系统解析", "custom": "指定 DNS", "proxy": "代理解析"}\n    if source: lines.append("    解析方式：" + labels.get(source, clean(source)))\n    if dns.get("error"): lines.append("    解析错误：" + clean(dns["error"]))\n    for q in dns.get("queries", []):\n        stdout = q.get("stdout", "")\n        status = re.search(r"status:\\s*(\\w+)", stdout)\n        timing = re.search(r"Query time:\\s*(\\d+)\\s*msec", stdout)\n        lines.append("    DNS %s：%s，查询 %s，退出码 %s" % (\n            clean(q.get("server", "--")), status.group(1) if status else "无响应状态",\n            timing.group(1) + " ms" if timing else "--", q.get("rc", "--")))\n        if q.get("stderr"): lines += raw_lines(q["stderr"], "      ")\n    evidence = dns.get("evidence", {})\n    if evidence.get("rc") and evidence.get("stderr"):\n        lines += raw_lines(evidence["stderr"], "    解析错误：")\n    return lines\n\n\ndef detail(row):\n    lines = [heading(row), "    " + clean(row.get("observation", ""))]\n    probe = row.get("probe")\n    metrics = row.get("metrics", {})\n    evidence = row.get("evidence", {})\n    if row.get("public_ip"): lines.append("    公网 IP：" + clean(row["public_ip"]))\n    if metrics:\n        code = metrics.get("http_code") or "--"\n        lines.append("    HTTP %s | 实际对端 %s | curl 退出码 %s" % (\n            code, clean(metrics.get("remote_ip") or "--"), row.get("curl_exit", "--")))\n        lines.append("    TCP %s | TLS %s | TTFB %s | 总耗时 %s" % (\n            phase(metrics, "time_connect", "time_namelookup"),\n            "不适用" if str(row.get("target", "")).startswith("http://") else phase(metrics, "time_appconnect", "time_connect"),\n            milliseconds(metrics.get("time_starttransfer")), milliseconds(metrics.get("time_total"))))\n        lines.append("    正文字节 %s | 平均下载 %s B/s" % (\n            number(metrics.get("body_bytes_observed", metrics.get("size_download")), digits=0),\n            number(metrics.get("speed_download"))))\n        if metrics.get("redirect_url"):\n            lines.append("    重定向（未跟随）：" + clean(metrics["redirect_url"]))\n    if row.get("error_category"): lines.append("    错误类别：" + clean(row["error_category"]))\n    if row.get("stderr"): lines += raw_lines(row["stderr"], "    错误：")\n    if probe == "dns": lines += dns_lines(evidence)\n    elif row.get("dns"): lines += dns_lines(row["dns"])\n    if probe == "ping" and "attempted" in row:\n        lines.append("    发送 %s / 收到 %s | 丢包 %s" % (\n            number(row.get("attempted"), digits=0), number(row.get("received"), digits=0), number(row.get("loss_pct"), "%")))\n        lines.append("    RTT 最小 %s | 平均 %s | 最大 %s | 标准差 %s" % tuple(\n            number(row.get(k), " ms") for k in ("rtt_min_ms", "rtt_mean_ms", "rtt_max_ms", "rtt_stddev_ms")))\n    if probe in ("tcp", "telegram_endpoint") and "attempted" in row:\n        lines.append("    端口 %s | 连接成功 %s/%s | 失败 %s | 中位耗时 %s" % (\n            row.get("port", "--"), row.get("succeeded", 0), row.get("attempted", 0),\n            row.get("failed", 0), number(row.get("median_ms"), " ms")))\n        if row.get("samples_ms"):\n            lines.append("    成功样本（ms）：" + ", ".join(number(x) for x in row["samples_ms"]))\n        for error in dict.fromkeys(row.get("errors", [])): lines.append("    连接错误：" + clean(error))\n    if probe == "speed": lines.append("    有效测速：" + number(row.get("mbps"), " Mbps"))\n    if probe == "conntrack":\n        lines.append("    当前 %s / 上限 %s" % (number(row.get("count"), digits=0), number(row.get("limit"), digits=0)))\n    if probe in ("interfaces", "route") and isinstance(evidence, dict):\n        try:\n            entries = json.loads(evidence.get("stdout", ""))\n            if not isinstance(entries, list): raise ValueError()\n            for entry in entries:\n                if probe == "interfaces":\n                    addresses = ["%s/%s" % (x.get("local", ""), x.get("prefixlen", "")) for x in entry.get("addr_info", [])]\n                    lines.append("    %s | 状态 %s | MTU %s | 地址 %s" % (clean(entry.get("ifname", "--")),\n                        clean(entry.get("operstate", "--")), clean(entry.get("mtu", "--")), clean(", ".join(addresses)) or "--"))\n                else:\n                    lines.append("    接口 %s | 源地址 %s | 网关 %s" % (clean(entry.get("dev", "--")),\n                        clean(entry.get("prefsrc", entry.get("src", "--"))), clean(entry.get("gateway", "直连/未返回"))))\n        except (ValueError, TypeError, AttributeError):\n            lines += raw_lines(evidence.get("stdout", ""))\n    elif probe in ("sockets", "clock", "mtr", "unlock") and isinstance(evidence, dict):\n        if probe == "mtr":\n            lines.append("    协议 %s / 端口 %s | 已证实到达目标：%s" % (\n                clean(row.get("protocol", "--")), row.get("port", "--"), "是" if row.get("reached") else "否"))\n        lines += raw_lines(evidence.get("stdout", ""))\n    if isinstance(evidence, dict) and evidence.get("stderr"):\n        lines += raw_lines(evidence["stderr"], "    工具提示：")\n    if probe == "pmtu" and isinstance(evidence, list):\n        for sample in evidence:\n            stats = sample.get("stats", {})\n            lines.append("    payload %s：收到 %s/%s，退出码 %s" % (sample.get("payload", "--"),\n                number(stats.get("received"), digits=0), number(stats.get("attempted"), digits=0), sample.get("result", {}).get("rc", "--")))\n    if row.get("warning"): lines.append("    提醒：" + clean(row["warning"]))\n    return "\\n".join(lines)\n\n\ndef render_report(report):\n    rows = report.get("results", [])\n    counts = {state: sum(r.get("status") == state for r in rows) for state in STATUS}\n    lines = ["", "=" * 64, "VPS 网络体检报告  v" + clean(report.get("version", "")),\n             "时间：" + clean(report.get("time", "")),\n             "通过 {PASS} | 注意 {WARN} | 失败 {FAIL} | 未确定 {UNKNOWN} | 已跳过 {SKIP}".format(**counts)]\n    if report.get("cancelled"): lines.append("本轮已中断；以下仅包含已取得的结果。")\n    if report.get("deadline_exceeded"): lines.append("已达到总时限，部分检测可能未完成。")\n    lines.append("正文接收量：%s 字节" % number(report.get("downloaded_bytes"), digits=0))\n    lines += ["", "优先关注"]\n    issues = sorted([r for r in rows if r.get("status") != "PASS"],\n                    key=lambda r: {"FAIL": 0, "WARN": 1, "UNKNOWN": 2, "SKIP": 3}.get(r.get("status"), 4))\n    if issues:\n        lines.extend("  " + progress_line(row) for row in issues)\n    else:\n        lines.append("  本轮没有记录异常；结果仅代表此次探测的目标和时间。" if rows else "  没有取得检测结果。")\n    covered = set()\n    for title, probes in GROUPS:\n        group = [r for r in rows if r.get("probe") in probes]\n        if group:\n            lines += ["", "─" * 32, title, "─" * 32]\n            lines.extend(detail(row) + "\\n" for row in group)\n            covered |= probes\n    other = [r for r in rows if r.get("probe") not in covered]\n    if other: lines += ["", "其他结果"] + [detail(row) for row in other]\n    if any(r.get("metrics") for r in rows):\n        lines.append("耗时说明：TCP/TLS 为阶段差值，TTFB/总耗时从请求开始累计；DNS 已预解析，缺测用 -- 表示。")\n    lines.append("判断说明：HTTP 拒绝、ICMP 无响应或中间跳丢包，不能单独证明整机网络故障。")\n    lines.append("=" * 64)\n    return "\\n".join(lines) + "\\n"\n', '<netcheck_report>', 'exec'), _report.__dict__)
+sys.modules['netcheck_report'] = _report
 
 #!/usr/bin/env python3
 """VPS network diagnostics. Python >=3.8, standard library only."""
@@ -35,8 +39,9 @@ import threading
 import time
 from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
+from netcheck_report import render_report, progress_line
 
-VERSION = "2.0.0-rc1"
+VERSION = "2.0.0-rc2"
 DEFAULT_URLS = ["https://www.cloudflare.com/", "https://www.google.com/",
                 "https://github.com/", "https://www.microsoft.com/", "https://www.baidu.com/"]
 TG_ENDPOINTS = ["149.154.175.50", "149.154.167.51", "149.154.175.100",
@@ -272,8 +277,7 @@ class Checker:
     def add(self, row):
         with self.lock:
             self.rows.append(row)
-            print("[{status}] {probe} {target}: {observation}".format(**{
-                k: safe_text(v) for k, v in row.items()}), flush=True)
+            print(progress_line(row), flush=True)
         return row
 
     def resolve(self, host, family):
@@ -602,9 +606,12 @@ class Checker:
                   "results": self.rows, "cancelled": STOP.is_set(), "deadline_exceeded": time.monotonic() >= self.deadline}
         target = self.run_dir / "report.json"
         target.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
-        text = "\n".join("[{status}] {probe} {target}: {observation}".format(**r) for r in self.rows)
-        (self.run_dir / "report.txt").write_text(text + "\n", encoding="utf-8")
-        print("报告：" + str(target))
+        text = render_report(report)
+        text_path = self.run_dir / "report.txt"
+        text_path.write_text(text, encoding="utf-8")
+        print(text, end="", flush=True)
+        print("文本报告：" + str(text_path))
+        print("JSON 报告：" + str(target))
         if STOP.is_set():
             return 130
         if any(r["status"] == "FAIL" for r in self.rows):
@@ -667,21 +674,87 @@ def interactive_options(args):
     # separate reader/writer streams also work when stdin carries our heredoc.
     with open("/dev/tty", "r", encoding="utf-8") as reader, \
             open("/dev/tty", "w", encoding="utf-8", buffering=1) as writer:
-        writer.write("1 快速体检 / 2 完整体检 / 3 Telegram / 4 指定目标\n选择 [1]: ")
-        writer.flush()
-        line = reader.readline()
-        if not line:
-            raise OSError("终端输入已关闭，未开始检测")
-        choice = line.strip() or "1"
+        def ask(label, default=None, validate=None):
+            while True:
+                writer.write(label + (" [%s]" % default if default is not None else "") + ": ")
+                writer.flush()
+                line = reader.readline()
+                if not line: raise OSError("终端输入已关闭，未开始检测")
+                value = line.strip() or (str(default) if default is not None else "")
+                try:
+                    return validate(value) if validate else value
+                except (ValueError, argparse.ArgumentTypeError) as exc:
+                    writer.write("  " + str(exc) + "，请重新输入。\n")
+
+        def integer(low, high):
+            def validate(value):
+                try: value = int(value)
+                except ValueError: raise ValueError("请输入整数")
+                if not low <= value <= high: raise ValueError("范围为 %s–%s" % (low, high))
+                return value
+            return validate
+
+        def targets(value):
+            return ",".join(valid_target(x.strip()) for x in value.split(","))
+
+        def resolvers(value):
+            return ",".join(valid_ip(x.strip()) for x in value.split(","))
+
+        def menu_choice(value):
+            if value.lower() not in ("1", "2", "3", "4", "5", "6", "7", "8", "h", "q", "0"):
+                raise ValueError("请选择 1–8、h 或 q")
+            return value.lower()
+
+        while True:
+            writer.write("\n" + "=" * 52 + "\nVPS 网络体检 v%s\n" % VERSION +
+                         "检测完成后自动在终端展示详细报告，并保存文本/JSON。\n" +
+                         "  1) 快速体检        DNS、网站、延迟和连通性\n" +
+                         "  2) 完整体检        增加路由追踪和路径 MTU\n" +
+                         "  3) Telegram       官网与入口 TCP 连通性\n" +
+                         "  4) 指定目标质量   自选 IP/域名、次数和端口\n" +
+                         "  5) 体检＋下载测速 会产生额外下载流量\n" +
+                         "  6) 加测指定网站   输入网址，查看具体耗时\n" +
+                         "  7) 使用指定 DNS   只影响本轮，不改系统\n" +
+                         "  8) IPv4＋IPv6     双栈完整体检\n" +
+                         "  h) 全部参数说明\n  q) 退出\n" + "=" * 52 + "\n")
+            choice = ask("选择", "1", menu_choice)
+            if choice in ("q", "0"):
+                writer.write("已退出，未开始检测。\n")
+                return False
+            if choice == "h":
+                writer.write(parser().format_help())
+                continue
+            break
+        args.quality_only, args.telegram_only, args.unlock_only = None, False, False
         if choice == "1": args.quick, args.full = True, False
         elif choice == "2": args.quick, args.full = False, True
         elif choice == "3": args.telegram_only = True
         elif choice == "4":
-            writer.write("目标 IP/域名（逗号分隔）: "); writer.flush()
-            args.quality_only = reader.readline().strip()
-            if not args.quality_only: raise ValueError("未指定目标")
-        else:
-            raise ValueError("无效菜单选项")
+            args.quality_only = ask("目标 IP/域名（逗号分隔）", validate=targets)
+            args.count = ask("采样次数", args.count if args.count != 5 else 20, integer(1, 100))
+            args.port = ask("TCP 端口", args.port, integer(1, 65535))
+            versions = set()
+            for target in args.quality_only.split(","):
+                try: versions.add(ipaddress.ip_address(target).version)
+                except ValueError: pass
+            default_family = "0" if versions == {4, 6} else "6" if versions == {6} else args.family
+            def family(value):
+                if value not in ("4", "6", "0"): raise ValueError("填写 4、6 或 0（双栈）")
+                return value
+            args.family = ask("地址族：4=IPv4，6=IPv6，0=双栈", default_family, family)
+            args.deadline = max(args.deadline, min(3600, len(args.quality_only.split(",")) * (args.count * 2 + 40)))
+        elif choice == "5":
+            args.speed = True
+            writer.write("测速单个地址族最多请求 %.1f MB；全局正文预算 %.1f MB。\n" % (args.speed_mb, args.max_download_mb))
+        elif choice == "6":
+            args.url.append(ask("网站 URL", validate=lambda s: valid_url(s if "://" in s else "https://" + s)))
+        elif choice == "7":
+            args.dns = [ask("DNS IP（逗号分隔）", "1.1.1.1,8.8.8.8", resolvers)]
+        elif choice == "8":
+            args.family, args.quick, args.full = "0", False, True
+        writer.write("\n开始检测：%s，总时限 %s 秒。\n" % ({"4": "IPv4", "6": "IPv6", "0": "IPv4＋IPv6"}[args.family], args.deadline))
+        writer.flush()
+        return True
 
 
 def main(argv=None):
@@ -690,7 +763,8 @@ def main(argv=None):
     args = p.parse_args(argv)
     if args.interactive:
         try:
-            interactive_options(args)
+            if interactive_options(args) is False:
+                return 0
         except OSError as exc:
             p.error("无法访问交互终端：%s；无终端环境请指定 --quick 等 CLI 参数" % exc)
         except ValueError as exc:
