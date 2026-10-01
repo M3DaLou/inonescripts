@@ -9,7 +9,7 @@
 | v2.0.0-rc1 | [`vps-netcheck-v2.sh`](vps-netcheck-v2.sh) | 重构候选版，Python 3.8+，默认只读、不自动安装 |
 | v1.5.0 | [`vps-netcheck.sh`](vps-netcheck.sh) | 历史 Bash 版本，原入口保留；存在已记录的误判和修复风险 |
 
-**v2 已通过 51 项自动化测试，仍需 Linux systemd、iptables、真实双栈和 SSH 回滚实机验收。**
+**v2 已在 Linux 容器中通过 67 项自动化测试，包含真实终端和单文件菜单；仍需 systemd、iptables、真实双栈和 SSH 回滚实机验收。**
 详细范围见[验证记录](docs/verification.md)。
 
 ## 使用 v2

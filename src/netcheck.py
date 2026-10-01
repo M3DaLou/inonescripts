@@ -600,7 +600,7 @@ class Checker:
 
 
 def parser():
-    p = argparse.ArgumentParser(description="VPS 网络诊断 v%s：默认只读、不自动安装；Python 3.8+" % VERSION)
+    p = argparse.ArgumentParser(prog="vps-netcheck-v2.sh", description="VPS 网络诊断 v%s：默认只读、不自动安装；Python 3.8+" % VERSION)
     mode = p.add_mutually_exclusive_group()
     mode.add_argument("--quick", action="store_true", help="跳过 mtr/PMTU")
     mode.add_argument("--full", action="store_true", help="增加 PMTU 采样")
@@ -647,25 +647,39 @@ def parser():
     return p
 
 
+def interactive_options(args):
+    # A TTY is not seekable. Buffered r+ creates BufferedRandom and fails;
+    # separate reader/writer streams also work when stdin carries our heredoc.
+    with open("/dev/tty", "r", encoding="utf-8") as reader, \
+            open("/dev/tty", "w", encoding="utf-8", buffering=1) as writer:
+        writer.write("1 快速体检 / 2 完整体检 / 3 Telegram / 4 指定目标\n选择 [1]: ")
+        writer.flush()
+        line = reader.readline()
+        if not line:
+            raise OSError("终端输入已关闭，未开始检测")
+        choice = line.strip() or "1"
+        if choice == "1": args.quick, args.full = True, False
+        elif choice == "2": args.quick, args.full = False, True
+        elif choice == "3": args.telegram_only = True
+        elif choice == "4":
+            writer.write("目标 IP/域名（逗号分隔）: "); writer.flush()
+            args.quality_only = reader.readline().strip()
+            if not args.quality_only: raise ValueError("未指定目标")
+        else:
+            raise ValueError("无效菜单选项")
+
+
 def main(argv=None):
     STOP.clear()
     p = parser()
     args = p.parse_args(argv)
     if args.interactive:
         try:
-            with open("/dev/tty", "r+") as tty:
-                tty.write("1 快速体检 / 2 完整体检 / 3 Telegram / 4 指定目标\n选择 [1]: "); tty.flush()
-                choice = tty.readline().strip() or "1"
-                if choice == "1": args.quick = True
-                elif choice == "2": args.full = True
-                elif choice == "3": args.telegram_only = True
-                elif choice == "4":
-                    tty.write("目标 IP/域名（逗号分隔）: "); tty.flush()
-                    args.quality_only = tty.readline().strip()
-                    if not args.quality_only: p.error("未指定目标")
-                else: p.error("无效菜单选项")
-        except OSError:
-            p.error("交互模式需要 /dev/tty；请使用 CLI 参数")
+            interactive_options(args)
+        except OSError as exc:
+            p.error("无法访问交互终端：%s；无终端环境请指定 --quick 等 CLI 参数" % exc)
+        except ValueError as exc:
+            p.error(str(exc))
     try:
         args.dns = [valid_ip(x.strip()) for item in args.dns for x in item.split(",")]
         targets = [valid_target(x.strip()) for item in args.quality + ([args.quality_only] if args.quality_only else []) for x in item.split(",")]

@@ -245,6 +245,14 @@ def apply_plan(plan, args):
     return 0
 
 
+def confirm_repair():
+    # Do not open a terminal with buffered r+: it requires seek support.
+    with open("/dev/tty", "r", encoding="utf-8") as reader, \
+            open("/dev/tty", "w", encoding="utf-8", buffering=1) as writer:
+        writer.write("按以上计划应用？[y/N] "); writer.flush()
+        return reader.readline().strip().lower() == "y"
+
+
 def repair_main(args):
     try:
         if args.commit or args.rollback or args.apply:
@@ -269,9 +277,7 @@ def repair_main(args):
         print(json.dumps(plan, ensure_ascii=False, indent=2))
         if not args.apply: print("仅显示计划；未修改系统。应用需显式加 --apply。"); return 0
         if not args.yes:
-            with open("/dev/tty", "r+") as tty:
-                tty.write("按以上计划应用？[y/N] "); tty.flush()
-                if tty.readline().strip().lower() != "y": print("已取消"); return 0
+            if not confirm_repair(): print("已取消"); return 0
         with state_lock():
             # Rebuild under lock to capture the actual pre-apply state.
             current = build_plan(args)
